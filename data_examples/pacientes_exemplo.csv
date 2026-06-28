@@ -1,0 +1,2 @@
+paciente_id,data_cadastro,nome,data_nascimento,idade,sexo,telefone,email,profissao,horario_trabalho,observacoes
+0001,2026-06-29,Paciente Exemplo,1985-05-10,41,F,(21) 99999-0000,paciente.exemplo@email.com,Administradora,09h às 18h,Registro de exemplo para testes.

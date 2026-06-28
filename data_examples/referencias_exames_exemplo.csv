@@ -1,0 +1,4 @@
+referencia_id,nome_exame,sexo,idade_min,idade_max,valor_min,valor_max,unidade,fonte_referencia,observacoes
+0001,Glicose,Todos,18,120,70,99,mg/dL,Referência cadastrada para teste,Revisar conforme laboratório/instituição.
+0002,Vitamina D,Todos,18,120,30,100,ng/mL,Referência cadastrada para teste,Revisar conforme laboratório/instituição.
+0003,Triglicerídeos,Todos,18,120,0,150,mg/dL,Referência cadastrada para teste,Revisar conforme laboratório/instituição.

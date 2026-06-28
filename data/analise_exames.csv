@@ -1,0 +1,4 @@
+analise_id,paciente_id,data_exame,nome_exame_original,nome_exame_padronizado,resultado,unidade,valor_min,valor_max,status,insight,fonte_referencia
+1,0001,2026-06-20,Glicemia de jejum,Glicose,102,mg/dL,70,99,Acima,Glicose está acima da faixa de referência cadastrada.,Referência cadastrada para teste
+2,0001,2026-06-20,Vit D,Vitamina D,24,ng/mL,30,100,Abaixo,Vitamina D está abaixo da faixa de referência cadastrada.,Referência cadastrada para teste
+3,0001,2026-06-20,Triglicerídeos,Triglicerídeos,132,mg/dL,0,150,Normal,Triglicerídeos está dentro da faixa de referência cadastrada.,Referência cadastrada para teste

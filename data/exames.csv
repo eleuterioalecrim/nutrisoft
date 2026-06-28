@@ -1,0 +1,4 @@
+exame_id,paciente_id,data_exame,nome_exame,resultado,unidade,observacoes
+0001,0001,2026-06-20,Glicemia de jejum,102,mg/dL,Exemplo para teste.
+0002,0001,2026-06-20,Vit D,24,ng/mL,Exemplo para teste.
+0003,0001,2026-06-20,Triglicerídeos,132,mg/dL,Exemplo para teste.

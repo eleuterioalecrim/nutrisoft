@@ -1,0 +1,2 @@
+recordatorio_id,paciente_id,data_registro,desjejum,lanche_manha,almoco,lanche_tarde,jantar,ceia,observacoes
+0001,0001,2026-06-29,Café com leite e pão,Banana,"Arroz, feijão, frango e salada",Iogurte,Omelete e salada,Chá,Exemplo de recordatório habitual.
