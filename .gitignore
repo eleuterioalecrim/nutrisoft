@@ -1,0 +1,45 @@
+# Dados reais / sensíveis
+data/
+data_flet/
+relatorios/
+reports/
+backups/
+backups_final/
+logs/
+importacoes/
+
+# Builds / pacotes
+dist_windows/
+dist_android/
+installers/
+releases/
+build/
+*.zip
+*.tar.gz
+*.apk
+*.aab
+*.exe
+*.msi
+
+# PDFs e documentos clínicos
+*.pdf
+
+# Backups de código
+nutrisoft_flet_app_backup_*.py
+nutrisoft_flet_app_antes_*.py
+nutrisoft_flet_app_OK.py
+nutrisoft_flet_app_dashboard_funcional_OK.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Sistema
+.DS_Store
+Thumbs.db
+*.log
