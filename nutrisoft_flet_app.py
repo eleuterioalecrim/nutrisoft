@@ -56,6 +56,7 @@ import shutil
 
 import json
 import flet as ft
+from exames_grupos_prioritarios import listar_grupos_disponiveis, ordenar_exames_por_prioridade, identificar_grupo_exame, ordenar_itens_exames_por_prioridade
 
 # ============================================================
 # BASE CSV DA NOVA APLICAÇÃO FLET
@@ -2438,12 +2439,38 @@ def exames_ja_cadastrados_por_data(paciente_id, data_exame):
     return [exame for exame in CATALOGO_EXAMES if exame["id"] in ids]
 
 
+
+# ===== PATCH: GRUPOS PRIORITÁRIOS DE EXAMES =====
+def criar_opcoes_grupos_exames(lista_exames):
+    """
+    Cria opções de grupos para Dropdown Flet.
+    """
+    return [
+        ft.dropdown.Option(key=grupo, text=grupo)
+        for grupo in listar_grupos_disponiveis(lista_exames)
+    ]
+
+
+def criar_opcoes_exames_por_grupo(lista_exames, grupo=None, exames_ja_cadastrados=None):
+    """
+    Cria opções de exames ordenadas por prioridade e filtradas por grupo.
+    """
+    exames = ordenar_exames_por_prioridade(
+        lista_exames,
+        grupo=grupo,
+        exames_ja_cadastrados=exames_ja_cadastrados,
+    )
+
+    return [
+        ft.dropdown.Option(key=exame, text=exame)
+        for exame in exames
+    ]
+# ===== FIM PATCH: GRUPOS PRIORITÁRIOS DE EXAMES =====
+
 def exames_disponiveis_por_data(paciente_id, data_exame):
     chave = chave_exames_paciente_data(paciente_id, data_exame)
     ids = set(EXAMES_CADASTRADOS_MOCK.get(chave, []))
-    return [exame for exame in CATALOGO_EXAMES if exame["id"] not in ids]
-
-
+    return ordenar_itens_exames_por_prioridade([exame for exame in CATALOGO_EXAMES if exame["id"] not in ids])
 def numero_br_para_float(valor):
     try:
         return float(str(valor).replace(",", ".").strip())
@@ -6782,6 +6809,7 @@ def main_original_nutrisoft(page: ft.Page):
             ft.NavigationRailDestination(
                 icon=ft.Icons.BIOTECH_OUTLINED,
                 selected_icon=ft.Icons.BIOTECH,
+                # Exames agrupados por categoria e ordenados por prioridade
                 label="Exames",
             ),
             ft.NavigationRailDestination(
