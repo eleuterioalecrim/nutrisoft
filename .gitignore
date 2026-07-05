@@ -46,3 +46,6 @@ Thumbs.db
 
 # Backups locais gerados em patches
 *.bak_*
+
+# Backups locais gerados em patches
+*.bak_*
