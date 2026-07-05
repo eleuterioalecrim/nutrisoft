@@ -43,3 +43,6 @@ env/
 .DS_Store
 Thumbs.db
 *.log
+
+# Backups locais gerados em patches
+*.bak_*
