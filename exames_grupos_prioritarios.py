@@ -2,7 +2,7 @@
 """
 Configuração central dos grupos de exames do NutriSoft.
 
-Este módulo organiza os exames por grupos e prioriza, dentro de cada grupo,
+Organiza exames por grupos e coloca como primeira opção, dentro de cada grupo,
 os exames marcados no documento de solicitação.
 """
 
@@ -170,3 +170,79 @@ def ordenar_exames_por_prioridade(exames, grupo=None, exames_ja_cadastrados=None
         return (1, 9999, exame_normalizado)
 
     return sorted(exames_filtrados, key=chave_ordenacao)
+
+def obter_nome_exame_item(item):
+    """
+    Extrai o nome do exame a partir de string ou dicionário de catálogo.
+    """
+    if isinstance(item, dict):
+        for chave in ("nome", "exame", "nome_exame", "descricao", "label", "text"):
+            valor = item.get(chave)
+            if valor:
+                return str(valor).strip()
+
+        # fallback seguro: usa id se não houver nome
+        valor = item.get("id")
+        if valor:
+            return str(valor).strip()
+
+    return str(item or "").strip()
+
+
+def ordenar_itens_exames_por_prioridade(itens, grupo=None, exames_ja_cadastrados=None):
+    """
+    Ordena uma lista de itens de catálogo preservando os objetos originais.
+
+    Diferente de ordenar_exames_por_prioridade(), esta função aceita:
+    - strings;
+    - dicionários do CATALOGO_EXAMES;
+    - qualquer objeto que possa ser convertido para texto.
+
+    Retorna os próprios itens originais, apenas reordenados e filtrados.
+    """
+    itens = list(itens or [])
+    exames_ja_cadastrados = exames_ja_cadastrados or []
+
+    ja_cadastrados_normalizados = {
+        normalizar_texto(obter_nome_exame_item(exame))
+        for exame in exames_ja_cadastrados
+    }
+
+    prioritarios = EXAMES_PRIORITARIOS_POR_GRUPO.get(grupo, []) if grupo else []
+
+    ordem_prioritarios = {
+        normalizar_texto(exame): indice
+        for indice, exame in enumerate(prioritarios)
+    }
+
+    filtrados = []
+
+    for item in itens:
+        nome = obter_nome_exame_item(item)
+
+        if not nome:
+            continue
+
+        nome_normalizado = normalizar_texto(nome)
+
+        if nome_normalizado in ja_cadastrados_normalizados:
+            continue
+
+        grupo_exame = identificar_grupo_exame(nome)
+
+        if grupo and grupo_exame != grupo:
+            continue
+
+        filtrados.append(item)
+
+    def chave_ordenacao(item):
+        nome = obter_nome_exame_item(item)
+        nome_normalizado = normalizar_texto(nome)
+
+        if nome_normalizado in ordem_prioritarios:
+            return (0, ordem_prioritarios[nome_normalizado], nome_normalizado)
+
+        return (1, 9999, nome_normalizado)
+
+    return sorted(filtrados, key=chave_ordenacao)
+
