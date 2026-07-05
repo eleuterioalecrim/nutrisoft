@@ -854,7 +854,18 @@ def dashboard_view(page=None, on_novo_exame=None, on_excluir=None):
         for paciente in PACIENTES_MOCK:
             if str(paciente["id"]) == str(paciente_id):
                 return paciente
-        return PACIENTES_MOCK[0]
+        if PACIENTES_MOCK:
+            return PACIENTES_MOCK[0]
+
+        return {
+            "id": "",
+            "nome": "Nenhum paciente cadastrado",
+            "idade": "",
+            "sexo": "",
+            "data_nascimento": "",
+            "objetivo": "",
+            "observacoes": "",
+        }
 
     paciente_dropdown = ft.Dropdown(
         label="Paciente",
