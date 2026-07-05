@@ -56,7 +56,7 @@ import shutil
 
 import json
 import flet as ft
-from exames_grupos_prioritarios import listar_grupos_disponiveis, ordenar_exames_por_prioridade, identificar_grupo_exame, ordenar_itens_exames_por_prioridade
+from exames_grupos_prioritarios import listar_grupos_disponiveis, ordenar_exames_por_prioridade, identificar_grupo_exame, ordenar_itens_exames_por_prioridade, agrupar_itens_exames, garantir_prioritarios_no_catalogo, identificar_grupo_item, obter_nome_exame_item
 
 # ============================================================
 # BASE CSV DA NOVA APLICAÇÃO FLET
@@ -2406,6 +2406,213 @@ def chave_exames_paciente_data(paciente_id, data_exame):
     return f"{paciente_id}|{data_exame}"
 
 
+
+# ===== PATCH: RESOLUÇÃO DE REFERÊNCIAS POR NOME E ALIAS =====
+def _norm_ref_exame(valor):
+    import unicodedata
+    import re
+
+    texto = str(valor or "").strip().lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = re.sub(r"[^a-z0-9]+", " ", texto)
+    return " ".join(texto.split())
+
+
+ALIASES_REFERENCIAS_EXAMES = {
+    "hemoglobina glicosilada": [
+        "hemoglobina glicada",
+        "hemoglobina glicada a1c",
+        "hemoglobina glicada a 1 c",
+        "hba1c",
+        "a1c",
+    ],
+    "hemoglobina glicada": [
+        "hemoglobina glicosilada",
+        "hemoglobina glicada a1c",
+        "hba1c",
+        "a1c",
+    ],
+    "ferro serico": [
+        "ferro",
+        "ferro soro",
+        "ferro serico",
+    ],
+    "tgo": [
+        "tgo ast",
+        "transaminase glutamico oxalacetica",
+        "aspartato amino transferase",
+        "ast",
+    ],
+    "tgp": [
+        "tgp alt",
+        "transaminase glutamico piruvica",
+        "alanina amino transferase",
+        "alt",
+    ],
+    "t4 livre": [
+        "tiroxina t4 livre",
+        "tiroxina livre",
+        "t4 livre",
+    ],
+    "tsh": [
+        "hormonio tiroestimulante tsh",
+        "hormonio tireoestimulante tsh",
+        "tsh",
+    ],
+    "25oh d3": [
+        "25 oh d3",
+        "25oh vitamina d",
+        "25 hidroxivitamina d",
+        "vitamina d",
+    ],
+    "eas": [
+        "e a s",
+        "urina tipo i",
+        "sumario de urina",
+        "sumario urina",
+        "elementos anormais e sedimento",
+    ],
+    "e a s": [
+        "eas",
+        "urina tipo i",
+        "sumario de urina",
+        "elementos anormais e sedimento",
+    ],
+    "hemacias": [
+        "eritrocitos",
+        "eritrocitos hemacias",
+    ],
+    "hemoglobina": [
+        "hemoglobina",
+    ],
+    "hematocrito": [
+        "hematocrito",
+    ],
+    "vcm": [
+        "volume corpuscular medio",
+        "vcm",
+    ],
+    "hcm": [
+        "hemoglobina corpuscular media",
+        "hcm",
+    ],
+    "chcm": [
+        "concentracao de hemoglobina corpuscular media",
+        "chcm",
+    ],
+    "rdw": [
+        "coeficiente de variacao do volume eritrocitario rdw",
+        "coeficiente de variacao do volume eritrocitario",
+        "rdw",
+    ],
+    "leucocitos": [
+        "leucocitos",
+    ],
+    "plaquetas": [
+        "total de plaquetas",
+        "plaquetas",
+    ],
+    "triglicerideos": [
+        "triglicerides",
+        "triglicerideos",
+    ],
+    "hdl": [
+        "hdl colesterol",
+        "hdl",
+    ],
+    "ldl": [
+        "ldl colesterol",
+        "ldl",
+    ],
+    "vldl": [
+        "vldl colesterol",
+        "vldl",
+    ],
+}
+
+
+def _nomes_candidatos_referencia(nome):
+    base = _norm_ref_exame(nome)
+    candidatos = {base}
+
+    for chave, aliases in ALIASES_REFERENCIAS_EXAMES.items():
+        chave_norm = _norm_ref_exame(chave)
+
+        if base == chave_norm:
+            candidatos.update(_norm_ref_exame(alias) for alias in aliases)
+
+        for alias in aliases:
+            alias_norm = _norm_ref_exame(alias)
+            if base == alias_norm:
+                candidatos.add(chave_norm)
+                candidatos.update(_norm_ref_exame(a) for a in aliases)
+
+    return {c for c in candidatos if c}
+
+
+def _nomes_ref_normalizados(ref):
+    nomes = set()
+
+    if not isinstance(ref, dict):
+        return nomes
+
+    for chave in ("nome", "nome_exame", "exame", "descricao", "id"):
+        valor = ref.get(chave)
+        if valor:
+            nomes.add(_norm_ref_exame(valor))
+
+    return {n for n in nomes if n}
+
+
+def buscar_referencia_por_exame(exame):
+    """
+    Busca referência por:
+    1. id exato;
+    2. nome exato normalizado;
+    3. aliases conhecidos;
+    4. equivalência parcial segura para nomes longos.
+    """
+    if not isinstance(exame, dict):
+        exame = {"id": str(exame), "nome": str(exame)}
+
+    exame_id = str(exame.get("id") or "").strip()
+    exame_nome = str(exame.get("nome") or exame.get("nome_exame") or exame.get("exame") or "").strip()
+
+    # 1) ID exato
+    if exame_id:
+        for ref in REFERENCIAS_MOCK:
+            if str(ref.get("id") or "").strip() == exame_id:
+                return ref
+
+    candidatos = _nomes_candidatos_referencia(exame_nome)
+
+    # 2) Nome/alias exato normalizado
+    for ref in REFERENCIAS_MOCK:
+        nomes_ref = _nomes_ref_normalizados(ref)
+
+        if candidatos.intersection(nomes_ref):
+            return ref
+
+    # 3) Parcial seguro apenas para nomes suficientemente longos
+    for ref in REFERENCIAS_MOCK:
+        nomes_ref = _nomes_ref_normalizados(ref)
+
+        for candidato in candidatos:
+            if len(candidato) < 8:
+                continue
+
+            for nome_ref in nomes_ref:
+                if len(nome_ref) < 8:
+                    continue
+
+                if candidato in nome_ref or nome_ref in candidato:
+                    return ref
+
+    return None
+# ===== FIM PATCH: RESOLUÇÃO DE REFERÊNCIAS POR NOME E ALIAS =====
+
+
 def buscar_referencia_exame(exame_id):
     for ref in REFERENCIAS_MOCK:
         if ref["id"] == exame_id:
@@ -2423,25 +2630,113 @@ def cor_status_referencia(status):
 
 
 def montar_detalhe_referencia_exame(exame):
-    ref = buscar_referencia_exame(exame["id"])
-    if not ref:
-        return {
-            "grupo": exame.get("grupo", "Sem grupo"),
-            "unidade": "",
-            "referencia": "Sem referência",
-            "fonte": "Referência não cadastrada",
-            "status": "Pendente",
-            "tem_referencia": False,
+    """
+    Monta os detalhes de referência de um exame de forma segura.
+
+    Corrige inconsistências entre:
+    - catálogo de exames;
+    - referências;
+    - aliases;
+    - exames adicionados manualmente sem unidade/fonte/status.
+
+    Nunca acessa ref["unidade"] diretamente, para evitar KeyError.
+    """
+    if not isinstance(exame, dict):
+        exame = {
+            "id": str(exame),
+            "nome": str(exame),
         }
 
+    nome_exame = str(
+        exame.get("nome")
+        or exame.get("nome_exame")
+        or exame.get("exame")
+        or exame.get("id")
+        or ""
+    ).strip()
+
+    grupo_exame = str(exame.get("grupo") or "Exames laboratoriais").strip()
+
+    ref = None
+
+    try:
+        if "buscar_referencia_por_exame" in globals():
+            ref = buscar_referencia_por_exame(exame)
+    except Exception:
+        ref = None
+
+    if not ref:
+        try:
+            ref = buscar_referencia_exame(exame.get("id"))
+        except Exception:
+            ref = None
+
+    if not ref and str(exame.get("referencia") or "").strip():
+        ref = exame
+
+    if not isinstance(ref, dict):
+        return {
+            "tem_referencia": False,
+            "id": exame.get("id", ""),
+            "nome": nome_exame,
+            "grupo": grupo_exame,
+            "unidade": str(exame.get("unidade") or "").strip(),
+            "referencia": "",
+            "fonte": "",
+            "status": "Pendente",
+        }
+
+    unidade = str(
+        ref.get("unidade")
+        or exame.get("unidade")
+        or ""
+    ).strip()
+
+    referencia = str(
+        ref.get("referencia")
+        or ref.get("referencia_texto")
+        or exame.get("referencia")
+        or exame.get("referencia_texto")
+        or ""
+    ).strip()
+
+    fonte = str(
+        ref.get("fonte")
+        or ref.get("fonte_referencia")
+        or exame.get("fonte")
+        or exame.get("fonte_referencia")
+        or "Valores laboratoriais usuais"
+    ).strip()
+
+    grupo = str(
+        ref.get("grupo")
+        or exame.get("grupo")
+        or grupo_exame
+        or "Exames laboratoriais"
+    ).strip()
+
+    status = str(
+        ref.get("status")
+        or exame.get("status")
+        or ""
+    ).strip()
+
+    tem_referencia = bool(referencia)
+
+    if not status:
+        status = "Completa" if tem_referencia else "Pendente"
+
     return {
-        "grupo": ref["grupo"],
-        "unidade": ref["unidade"],
-        "referencia": ref["referencia"],
-        "fonte": ref["fonte"],
-        "status": ref["status"],
-        "tem_referencia": ref["status"].lower() == "completa",
+        "tem_referencia": tem_referencia,
+        "id": ref.get("id") or exame.get("id", ""),
+        "nome": ref.get("nome") or nome_exame,
+        "grupo": grupo,
+        "unidade": unidade,
+        "referencia": referencia,
+        "fonte": fonte,
+        "status": status,
     }
+
 
 
 def exames_ja_cadastrados_por_data(paciente_id, data_exame):
@@ -2477,6 +2772,8 @@ def criar_opcoes_exames_por_grupo(lista_exames, grupo=None, exames_ja_cadastrado
         for exame in exames
     ]
 # ===== FIM PATCH: GRUPOS PRIORITÁRIOS DE EXAMES =====
+
+CATALOGO_EXAMES = garantir_prioritarios_no_catalogo(CATALOGO_EXAMES)
 
 def exames_disponiveis_por_data(paciente_id, data_exame):
     chave = chave_exames_paciente_data(paciente_id, data_exame)
@@ -2855,6 +3152,96 @@ def exame_disponivel_card(page, exame, data_exame_control, paciente_control, atu
         ),
         padding=16,
     )
+
+
+
+def grupo_exames_card(page, nome_grupo, exames, data_exame_control, paciente_control, atualizar_callback=None):
+    """
+    Card macro de grupo de exames.
+
+    O grupo aparece como card principal e os exames individuais aparecem
+    como cards menores internos, mantendo o botão Lançar em cada exame.
+    """
+    exames = list(exames or [])
+
+    if not exames:
+        return ft.Container()
+
+    return ft.Container(
+        bgcolor="#F8FAFC",
+        border_radius=22,
+        padding=16,
+        content=ft.Column(
+            spacing=12,
+            controls=[
+                ft.Row(
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Row(
+                            spacing=10,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            controls=[
+                                ft.Container(
+                                    width=40,
+                                    height=40,
+                                    border_radius=14,
+                                    bgcolor="#DBEAFE",
+                                    alignment=ft.Alignment.CENTER,
+                                    content=ft.Icon(
+                                        ft.Icons.FOLDER_SPECIAL_OUTLINED,
+                                        color=COR_PRIMARIA,
+                                        size=23,
+                                    ),
+                                ),
+                                ft.Column(
+                                    spacing=2,
+                                    controls=[
+                                        ft.Text(
+                                            nome_grupo,
+                                            size=18,
+                                            weight=ft.FontWeight.BOLD,
+                                            color=COR_TEXTO,
+                                        ),
+                                        ft.Text(
+                                            "Grupo de exames — lance apenas os exames individuais abaixo",
+                                            size=12,
+                                            color=COR_TEXTO_FRACO,
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
+                        ft.Container(
+                            bgcolor="#EFF6FF",
+                            border_radius=30,
+                            padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+                            content=ft.Text(
+                                f"{len(exames)} exame(s)",
+                                size=11,
+                                color=COR_PRIMARIA,
+                                weight=ft.FontWeight.BOLD,
+                            ),
+                        ),
+                    ],
+                ),
+                ft.Column(
+                    spacing=10,
+                    controls=[
+                        exame_disponivel_card(
+                            page,
+                            exame,
+                            data_exame_control,
+                            paciente_control,
+                            atualizar_callback=atualizar_callback,
+                        )
+                        for exame in exames
+                    ],
+                ),
+            ],
+        ),
+    )
+
 
 
 def exame_bloqueado_card(exame):
@@ -3446,9 +3833,18 @@ def exames_view(page):
         disponiveis = exames_disponiveis_por_data(paciente_id, data)
         bloqueados = exames_ja_cadastrados_por_data(paciente_id, data)
 
+        grupos_disponiveis = agrupar_itens_exames(disponiveis)
+
         lista_disponiveis.controls = [
-            exame_disponivel_card(page, exame, data_exame, paciente_nome, atualizar_callback=atualizar_listas)
-            for exame in disponiveis
+            grupo_exames_card(
+                page,
+                nome_grupo,
+                exames_grupo,
+                data_exame,
+                paciente_nome,
+                atualizar_callback=atualizar_listas,
+            )
+            for nome_grupo, exames_grupo in grupos_disponiveis
         ]
 
         if not lista_disponiveis.controls:
@@ -3552,8 +3948,8 @@ def exames_view(page):
                                     ft.Row(
                                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                                         controls=[
-                                            ft.Text("Exames disponíveis para cadastro", size=18, weight=ft.FontWeight.BOLD, color=COR_TEXTO),
-                                            ft.Text("Somente opções válidas", size=12, color=COR_TEXTO_FRACO),
+                                            ft.Text("Exames disponíveis por grupo", size=18, weight=ft.FontWeight.BOLD, color=COR_TEXTO),
+                                            ft.Text("Cards macro com exames individuais", size=12, color=COR_TEXTO_FRACO),
                                         ],
                                     ),
                                     lista_disponiveis,
@@ -4204,18 +4600,85 @@ def multiselect_dropdown(page, titulo, opcoes, width=620):
         itens = itens_filtrados()
 
         if not itens:
-            lista_opcoes.controls.append(
-                ft.Container(
-                    bgcolor="#F8FAFC",
-                    border_radius=12,
-                    padding=12,
-                    content=ft.Text(
-                        "Nenhuma opção encontrada.",
-                        size=12,
-                        color=COR_TEXTO_FRACO,
-                    ),
+            termo_adicionar = (busca.value or "").strip()
+            pode_adicionar = bool(termo_adicionar) and str(titulo or "").strip().lower().startswith("alimentos -")
+
+            if pode_adicionar:
+                def adicionar_novo_alimento(e, item=termo_adicionar):
+                    item = str(item or "").strip()
+
+                    if not item:
+                        return
+
+                    if item not in opcoes_ordenadas:
+                        opcoes_ordenadas.append(item)
+                        opcoes_ordenadas.sort(key=lambda x: str(x).lower())
+
+                    if item not in selecionados:
+                        selecionados.append(item)
+                        selecionados.sort(key=lambda x: str(x).lower())
+
+                    try:
+                        _recordatorio_salvar_alimento_personalizado(titulo, item)
+                    except Exception:
+                        pass
+
+                    busca.value = ""
+                    montar_lista()
+                    atualizar_resumo()
+                    atualizar_chips()
+                    page.update()
+
+                lista_opcoes.controls.append(
+                    ft.Container(
+                        bgcolor="#F8FAFC",
+                        border_radius=12,
+                        padding=12,
+                        content=ft.Column(
+                            spacing=8,
+                            controls=[
+                                ft.Text(
+                                    f'Nenhuma opção encontrada para "{termo_adicionar}".',
+                                    size=12,
+                                    color=COR_TEXTO_FRACO,
+                                ),
+                                ft.Container(
+                                    bgcolor=COR_PRIMARIA,
+                                    border_radius=12,
+                                    padding=ft.Padding.symmetric(horizontal=14, vertical=10),
+                                    on_click=adicionar_novo_alimento,
+                                    content=ft.Row(
+                                        tight=True,
+                                        spacing=8,
+                                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                        controls=[
+                                            ft.Icon(ft.Icons.ADD, color="#FFFFFF", size=18),
+                                            ft.Text(
+                                                f'Adicionar "{termo_adicionar}"',
+                                                color="#FFFFFF",
+                                                size=13,
+                                                weight=ft.FontWeight.BOLD,
+                                            ),
+                                        ],
+                                    ),
+                                ),
+                            ],
+                        ),
+                    )
                 )
-            )
+            else:
+                lista_opcoes.controls.append(
+                    ft.Container(
+                        bgcolor="#F8FAFC",
+                        border_radius=12,
+                        padding=12,
+                        content=ft.Text(
+                            "Nenhuma opção encontrada.",
+                            size=12,
+                            color=COR_TEXTO_FRACO,
+                        ),
+                    )
+                )
             return
 
         for opcao in itens:
@@ -5416,138 +5879,384 @@ def anamnese_view(page):
 # LISTAS PADRONIZADAS - RECORDATÓRIO ALIMENTAR
 # ============================================================
 
-OPCOES_ALIMENTOS_RECORDATORIO = [
-    "Açaí",
-    "Achocolatado",
-    "Arroz branco",
-    "Arroz integral",
-    "Aveia",
-    "Banana",
-    "Batata doce",
-    "Batata inglesa",
-    "Biscoito doce",
-    "Biscoito salgado",
-    "Bolo",
+OPCOES_ALIMENTOS_RECORDATORIO_POR_REFEICAO = {
+    "Desjejum": [
+        "Água", "Café sem açúcar", "Café com açúcar", "Café com adoçante", "Café com leite",
+        "Leite integral", "Leite desnatado", "Leite sem lactose", "Bebida vegetal",
+        "Achocolatado", "Iogurte natural", "Iogurte grego", "Coalhada",
+        "Queijo branco", "Queijo minas", "Ricota", "Requeijão", "Manteiga",
+        "Pão francês", "Pão integral", "Pão de forma", "Tapioca", "Cuscuz", "Crepioca",
+        "Ovo cozido", "Ovo mexido", "Omelete", "Aveia", "Granola", "Cereal matinal",
+        "Banana", "Maçã", "Mamão", "Melão", "Melancia", "Morango", "Abacate", "Açaí",
+        "Pasta de amendoim", "Mel", "Geleia", "Suco natural", "Vitamina de frutas",
+        "Whey protein", "Outro",
+    ],
+    "Lanche da manhã": [
+        "Água", "Café", "Chá", "Iogurte", "Coalhada", "Fruta", "Banana", "Maçã",
+        "Pera", "Mamão", "Melão", "Morango", "Uva", "Tangerina", "Castanhas",
+        "Amendoim", "Pasta de amendoim", "Barra de proteína", "Barra de cereal",
+        "Biscoito integral", "Torrada integral", "Sanduíche natural",
+        "Pão integral com queijo", "Ovo cozido", "Whey protein", "Suco natural",
+        "Vitamina de frutas", "Outro",
+    ],
+    "Almoço": [
+        "Água", "Arroz branco", "Arroz integral", "Feijão preto", "Feijão carioca",
+        "Lentilha", "Grão-de-bico", "Macarrão", "Batata inglesa", "Batata doce",
+        "Mandioca", "Inhame", "Farofa", "Frango grelhado", "Frango cozido",
+        "Carne bovina", "Carne moída", "Peixe", "Atum", "Sardinha", "Ovo",
+        "Omelete", "Porco", "Salada verde", "Alface", "Rúcula", "Agrião",
+        "Tomate", "Cenoura", "Beterraba", "Pepino", "Brócolis", "Couve-flor",
+        "Abobrinha", "Berinjela", "Chuchu", "Abóbora", "Azeite", "Abacate",
+        "Suco natural", "Refrigerante", "Sobremesa", "Fruta", "Outro",
+    ],
+    "Lanche da tarde": [
+        "Água", "Café", "Chá", "Leite", "Iogurte", "Coalhada", "Fruta", "Banana",
+        "Maçã", "Mamão", "Morango", "Açaí", "Aveia", "Granola", "Castanhas",
+        "Amendoim", "Pasta de amendoim", "Pão francês", "Pão integral", "Tapioca",
+        "Crepioca", "Cuscuz", "Queijo branco", "Requeijão", "Ovo cozido",
+        "Ovo mexido", "Sanduíche natural", "Barra de proteína", "Barra de cereal",
+        "Whey protein", "Vitamina de frutas", "Suco natural", "Outro",
+    ],
+    "Jantar": [
+        "Água", "Arroz branco", "Arroz integral", "Feijão", "Lentilha", "Grão-de-bico",
+        "Macarrão", "Batata", "Batata doce", "Mandioca", "Sopa de legumes", "Caldo",
+        "Frango grelhado", "Frango cozido", "Carne bovina", "Carne moída", "Peixe",
+        "Atum", "Sardinha", "Ovo", "Omelete", "Salada verde", "Tomate", "Cenoura",
+        "Beterraba", "Pepino", "Brócolis", "Couve-flor", "Abobrinha", "Berinjela",
+        "Chuchu", "Abóbora", "Azeite", "Sanduíche natural", "Tapioca", "Crepioca",
+        "Fruta", "Outro",
+    ],
+    "Ceia": [
+        "Água", "Chá", "Leite", "Leite sem lactose", "Bebida vegetal", "Iogurte",
+        "Coalhada", "Banana", "Maçã", "Mamão", "Morango", "Abacate", "Aveia",
+        "Granola", "Castanhas", "Amêndoas", "Nozes", "Amendoim", "Pasta de amendoim",
+        "Queijo branco", "Ovo cozido", "Whey protein", "Outro",
+    ],
+}
+
+# Mantém compatibilidade com partes antigas do código que ainda esperem uma lista geral.
+OPCOES_ALIMENTOS_RECORDATORIO = sorted({
+    alimento
+    for lista in OPCOES_ALIMENTOS_RECORDATORIO_POR_REFEICAO.values()
+    for alimento in lista
+})
+
+
+
+# ===== PATCH: ALIMENTOS PERSONALIZADOS NO RECORDATÓRIO =====
+def _recordatorio_arquivo_alimentos_personalizados():
+    from pathlib import Path
+
+    pasta = Path("data_flet")
+    pasta.mkdir(parents=True, exist_ok=True)
+
+    return pasta / "alimentos_recordatorio_personalizados.csv"
+
+
+def _recordatorio_refeicao_por_titulo_dropdown(titulo):
+    texto = str(titulo or "").strip()
+
+    if texto.lower().startswith("alimentos -"):
+        return texto.split("-", 1)[1].strip()
+
+    return texto
+
+
+def _recordatorio_norm_texto(valor):
+    import unicodedata
+    import re
+
+    texto = str(valor or "").strip().lower()
+    texto = unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = re.sub(r"[^a-z0-9]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def _recordatorio_ler_alimentos_personalizados(refeicao=None):
+    import csv
+
+    arquivo = _recordatorio_arquivo_alimentos_personalizados()
+
+    if not arquivo.exists():
+        return []
+
+    refeicao_norm = _recordatorio_norm_texto(refeicao) if refeicao else ""
+
+    alimentos = []
+
+    try:
+        with arquivo.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+
+            for row in reader:
+                r_refeicao = str(row.get("refeicao") or "").strip()
+                alimento = str(row.get("alimento") or "").strip()
+
+                if not alimento:
+                    continue
+
+                if refeicao_norm and _recordatorio_norm_texto(r_refeicao) != refeicao_norm:
+                    continue
+
+                alimentos.append(alimento)
+    except Exception:
+        return []
+
+    # remove duplicados preservando ordem
+    vistos = set()
+    saida = []
+
+    for alimento in alimentos:
+        chave = _recordatorio_norm_texto(alimento)
+
+        if chave in vistos:
+            continue
+
+        vistos.add(chave)
+        saida.append(alimento)
+
+    return saida
+
+
+def _recordatorio_salvar_alimento_personalizado(titulo_dropdown, alimento):
+    import csv
+
+    refeicao = _recordatorio_refeicao_por_titulo_dropdown(titulo_dropdown)
+    alimento = str(alimento or "").strip()
+
+    if not refeicao or not alimento:
+        return False
+
+    if _recordatorio_norm_texto(alimento) in {
+        "outro",
+        "nao informado",
+        "não informado",
+        "nenhum item selecionado",
+    }:
+        return False
+
+    arquivo = _recordatorio_arquivo_alimentos_personalizados()
+    existentes = []
+
+    if arquivo.exists():
+        try:
+            with arquivo.open("r", encoding="utf-8", newline="") as f:
+                existentes = list(csv.DictReader(f))
+        except Exception:
+            existentes = []
+
+    chave_nova = (
+        _recordatorio_norm_texto(refeicao),
+        _recordatorio_norm_texto(alimento),
+    )
+
+    for row in existentes:
+        chave = (
+            _recordatorio_norm_texto(row.get("refeicao")),
+            _recordatorio_norm_texto(row.get("alimento")),
+        )
+
+        if chave == chave_nova:
+            return True
+
+    existentes.append({
+        "refeicao": refeicao,
+        "alimento": alimento,
+    })
+
+    with arquivo.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["refeicao", "alimento"])
+        writer.writeheader()
+        writer.writerows(existentes)
+
+    # Atualiza também a lista em memória para uso imediato.
+    try:
+        if refeicao in OPCOES_ALIMENTOS_RECORDATORIO_POR_REFEICAO:
+            if alimento not in OPCOES_ALIMENTOS_RECORDATORIO_POR_REFEICAO[refeicao]:
+                OPCOES_ALIMENTOS_RECORDATORIO_POR_REFEICAO[refeicao].insert(-1, alimento)
+    except Exception:
+        pass
+
+    return True
+# ===== FIM PATCH: ALIMENTOS PERSONALIZADOS NO RECORDATÓRIO =====
+
+
+def opcoes_recordatorio_por_refeicao(titulo):
+    refeicao = str(titulo or "").strip()
+    opcoes = list(OPCOES_ALIMENTOS_RECORDATORIO_POR_REFEICAO.get(refeicao, []))
+
+    if not opcoes:
+        opcoes = list(OPCOES_ALIMENTOS_RECORDATORIO)
+
+    personalizados = _recordatorio_ler_alimentos_personalizados(refeicao)
+
+    for alimento in personalizados:
+        if alimento not in opcoes:
+            if "Outro" in opcoes:
+                opcoes.insert(max(0, len(opcoes) - 1), alimento)
+            else:
+                opcoes.append(alimento)
+
+    if "Outro" not in opcoes:
+        opcoes.append("Outro")
+
+    return opcoes
+
+
+    if not opcoes:
+        opcoes = list(OPCOES_ALIMENTOS_RECORDATORIO)
+
+    if "Outro" not in opcoes:
+        opcoes.append("Outro")
+
+    return opcoes
+
+
+
+OPCOES_BEBIDAS_RECORDATORIO = [
+    "Não informado",
+    "Água",
     "Café",
-    "Carne bovina",
-    "Castanhas / oleaginosas",
-    "Chocolate",
-    "Crepioca",
-    "Cuscuz",
-    "Delivery / aplicativo",
-    "Doces",
-    "Feijão",
-    "Frango",
-    "Frutas",
-    "Hambúrguer",
-    "Iogurte",
-    "Legumes",
+    "Café sem açúcar",
+    "Café com açúcar",
+    "Café com adoçante",
+    "Café com leite",
+    "Chá",
     "Leite",
-    "Macarrão",
-    "Mandioca / aipim",
-    "Manteiga / margarina",
-    "Omelete",
-    "Ovo cozido",
-    "Ovo mexido",
-    "Pão branco",
-    "Pão de forma",
-    "Pão francês",
-    "Pão integral",
-    "Peixe",
-    "Pizza",
-    "Queijo",
-    "Refrigerante",
-    "Salgados",
-    "Salada",
-    "Sanduíche natural",
+    "Leite integral",
+    "Leite desnatado",
+    "Leite sem lactose",
+    "Bebida vegetal",
+    "Achocolatado",
     "Suco natural",
-    "Tapioca",
-    "Verduras",
+    "Suco industrializado",
+    "Refrigerante",
+    "Água de coco",
+    "Isotônico",
+    "Vitamina de frutas",
     "Whey protein",
     "Outro",
 ]
 
+
+
+
+
+
+# ===== COMPATIBILIDADE: OPÇÕES AUXILIARES DO RECORDATÓRIO =====
+# Listas usadas por card_refeicao_recordatorio() e recordatorio_view().
+# Mantidas separadas da nova lista de alimentos por tipo de refeição.
+
 OPCOES_BEBIDAS_RECORDATORIO = [
+    "Não informado",
     "Água",
-    "Água com gás",
-    "Bebida alcoólica",
-    "Café com açúcar",
+    "Café",
     "Café sem açúcar",
+    "Café com açúcar",
+    "Café com adoçante",
+    "Café com leite",
     "Chá",
-    "Energético",
-    "Iogurte líquido",
     "Leite",
-    "Refrigerante comum",
-    "Refrigerante zero",
-    "Shake / vitamina",
-    "Suco de caixinha",
+    "Leite integral",
+    "Leite desnatado",
+    "Leite sem lactose",
+    "Bebida vegetal",
+    "Achocolatado",
     "Suco natural",
-    "Não consumiu bebida",
+    "Suco industrializado",
+    "Refrigerante",
+    "Água de coco",
+    "Isotônico",
+    "Vitamina de frutas",
+    "Whey protein",
     "Outro",
 ]
 
 OPCOES_CARACTERISTICAS_REFEICAO = [
-    "Comeu com pressa",
-    "Comeu fora de casa",
-    "Comeu em casa",
-    "Comeu no trabalho",
-    "Comeu assistindo TV/celular",
-    "Comeu pouca quantidade",
-    "Comeu grande quantidade",
-    "Ficou satisfeito",
-    "Ainda ficou com fome",
-    "Pulou a refeição",
-    "Beliscou entre refeições",
-    "Teve vontade de doce depois",
-    "Teve desconforto gastrointestinal",
-    "Refeição planejada",
-    "Refeição improvisada",
-    "Delivery",
+    "Não informado",
+    "Caseira",
     "Restaurante",
+    "Self-service",
+    "Marmita",
+    "Lanche rápido",
+    "Industrializada",
+    "Ultraprocessada",
+    "Frita",
+    "Grelhada",
+    "Cozida",
+    "Assada",
+    "Crua",
+    "Com açúcar",
+    "Sem açúcar",
+    "Com adoçante",
+    "Rica em proteína",
+    "Rica em carboidrato",
+    "Rica em gordura",
+    "Rica em fibras",
+    "Baixa ingestão",
+    "Alta ingestão",
+    "Pré-treino",
+    "Pós-treino",
+    "Fora de casa",
     "Outro",
 ]
 
 OPCOES_OBSERVACOES_RECORDATORIO = [
-    "Baixa ingestão de água no dia",
-    "Consumo elevado de ultraprocessados",
-    "Consumo elevado de açúcar",
-    "Consumo elevado de fritura",
-    "Consumo elevado de álcool",
-    "Boa ingestão de frutas",
-    "Boa ingestão de verduras/legumes",
-    "Pouca proteína nas refeições",
-    "Longo intervalo entre refeições",
-    "Muitas refeições fora de casa",
-    "Rotina alimentar irregular",
-    "Dia atípico",
-    "Dia de treino",
-    "Dia sem treino",
-    "Sono ruim influenciou alimentação",
-    "Ansiedade influenciou alimentação",
-    "Sem observações relevantes",
+    "Não informado",
+    "Sem fome",
+    "Com fome",
+    "Muita fome",
+    "Comeu rápido",
+    "Comeu devagar",
+    "Comeu fora de casa",
+    "Comeu em restaurante",
+    "Comeu assistindo TV/celular",
+    "Sentiu saciedade",
+    "Sentiu estufamento",
+    "Sentiu azia",
+    "Sentiu gases",
+    "Sentiu náusea",
+    "Vontade de doce",
+    "Vontade de salgado",
+    "Beliscou entre refeições",
+    "Pulou refeição",
+    "Refeição incompleta",
+    "Boa aceitação",
+    "Baixa aceitação",
+    "Pré-treino",
+    "Pós-treino",
+    "Outro",
 ]
 
+OPCOES_HORARIOS_REFEICAO = [
+    "Não informado",
+    "Antes das 06h",
+    "06h - 08h",
+    "08h - 10h",
+    "10h - 12h",
+    "12h - 14h",
+    "14h - 16h",
+    "16h - 18h",
+    "18h - 20h",
+    "20h - 22h",
+    "Após 22h",
+]
 
-def montar_texto_refeicao(horario, alimentos, bebidas, caracteristicas):
-    partes = []
+OPCOES_QUANTIDADE_REFEICAO = [
+    "Não informado",
+    "Pequena",
+    "Média",
+    "Grande",
+    "Muito grande",
+    "Pouca quantidade",
+    "Quantidade habitual",
+    "Repetiu",
+    "Não terminou",
+    "Outro",
+]
 
-    horario_valor = getattr(horario, "value", "") if horario else ""
-    if horario_valor and horario_valor != "Não informado":
-        partes.append(f"Horário: {horario_valor}")
-
-    alimentos_txt = valores_multiselect(alimentos)
-    if alimentos_txt != "Não informado":
-        partes.append(f"Alimentos: {alimentos_txt}")
-
-    bebidas_txt = valores_multiselect(bebidas)
-    if bebidas_txt != "Não informado":
-        partes.append(f"Bebidas: {bebidas_txt}")
-
-    caracteristicas_txt = valores_multiselect(caracteristicas)
-    if caracteristicas_txt != "Não informado":
-        partes.append(f"Características: {caracteristicas_txt}")
-
-    return " | ".join(partes) if partes else "Não informado"
+# ===== FIM COMPATIBILIDADE: OPÇÕES AUXILIARES DO RECORDATÓRIO =====
 
 
 def card_refeicao_recordatorio(page, titulo):
@@ -5555,7 +6264,7 @@ def card_refeicao_recordatorio(page, titulo):
     alimentos_box, alimentos_sel = multiselect_dropdown(
         page,
         f"Alimentos - {titulo}",
-        OPCOES_ALIMENTOS_RECORDATORIO,
+        opcoes_recordatorio_por_refeicao(titulo),
         width=620,
     )
     bebidas_box, bebidas_sel = multiselect_dropdown(
@@ -5599,6 +6308,123 @@ def card_refeicao_recordatorio(page, titulo):
     }
 
 
+
+
+
+# ===== COMPATIBILIDADE: MONTAGEM DO TEXTO DO RECORDATÓRIO =====
+def _recordatorio_extrair_valores(valor):
+    """
+    Extrai valores de listas, controles Flet, dicionários ou strings.
+    Usado para montar o texto final de cada refeição.
+    """
+    if valor is None:
+        return []
+
+    if isinstance(valor, dict):
+        acumulado = []
+        for chave in [
+            "alimentos",
+            "bebidas",
+            "caracteristicas",
+            "observacoes",
+            "horario",
+            "quantidade",
+            "value",
+            "values",
+            "selected",
+            "selecionados",
+        ]:
+            if chave in valor:
+                acumulado.extend(_recordatorio_extrair_valores(valor.get(chave)))
+        return acumulado
+
+    if isinstance(valor, (list, tuple, set)):
+        acumulado = []
+        for item in valor:
+            acumulado.extend(_recordatorio_extrair_valores(item))
+        return acumulado
+
+    if hasattr(valor, "value"):
+        return _recordatorio_extrair_valores(getattr(valor, "value", None))
+
+    texto = str(valor or "").strip()
+
+    if not texto:
+        return []
+
+    if texto.lower() in {
+        "não informado",
+        "nao informado",
+        "nenhum item selecionado",
+        "none",
+        "null",
+    }:
+        return []
+
+    return [texto]
+
+
+def montar_texto_refeicao(*partes, **kwargs):
+    """
+    Monta uma frase única para a refeição.
+
+    Aceita chamadas antigas e novas:
+    - montar_texto_refeicao(alimentos, bebidas, caracteristicas, observacoes)
+    - montar_texto_refeicao(ctrl_dict)
+    - montar_texto_refeicao(..., horario=...)
+    """
+    labels = [
+        "Alimentos",
+        "Bebidas",
+        "Características",
+        "Observações",
+        "Horário",
+        "Quantidade",
+    ]
+
+    blocos = []
+
+    for idx, parte in enumerate(partes):
+        valores = _recordatorio_extrair_valores(parte)
+
+        if not valores:
+            continue
+
+        # Remove duplicados preservando ordem
+        vistos = set()
+        limpos = []
+
+        for v in valores:
+            vn = str(v).strip()
+            if not vn:
+                continue
+
+            chave = vn.lower()
+
+            if chave in vistos:
+                continue
+
+            vistos.add(chave)
+            limpos.append(vn)
+
+        if not limpos:
+            continue
+
+        label = labels[idx] if idx < len(labels) else "Itens"
+        blocos.append(f"{label}: {', '.join(limpos)}")
+
+    for chave, valor in kwargs.items():
+        valores = _recordatorio_extrair_valores(valor)
+
+        if valores:
+            blocos.append(f"{str(chave).replace('_', ' ').title()}: {', '.join(valores)}")
+
+    return " | ".join(blocos)
+
+
+# Alias defensivo caso alguma parte do código use variação de nome.
+montar_texto_recordatorio_refeicao = montar_texto_refeicao
+# ===== FIM COMPATIBILIDADE: MONTAGEM DO TEXTO DO RECORDATÓRIO =====
 
 
 def recordatorio_view(page):
@@ -6049,6 +6875,100 @@ def antropometria_view(page):
             resultado_area,
         ],
     )
+
+
+
+# ===== PATCH: DIAGNÓSTICO NUTRICIONAL INTELIGENTE NO PDF NUTRICIONAL =====
+def _pdf_adicionar_diagnostico_inteligente_nutricao(story, exames, h2, body, small):
+    """
+    Adiciona ao relatório nutricional PDF o diagnóstico nutricional.
+    """
+    try:
+        from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+        from reportlab.lib import colors
+        from reportlab.lib.units import cm
+        from xml.sax.saxutils import escape as xml_escape
+    except Exception:
+        return
+
+    try:
+        from diagnostico_nutricional_inteligente import gerar_diagnostico_inteligente
+    except Exception as exc:
+        story.append(Paragraph("Diagnóstico nutricional", h2))
+        story.append(Paragraph(f"Módulo indisponível: {xml_escape(str(exc))}", body))
+        story.append(Spacer(1, 10))
+        return
+
+    try:
+        diag = gerar_diagnostico_inteligente(exames or [])
+    except Exception as exc:
+        story.append(Paragraph("Diagnóstico nutricional", h2))
+        story.append(Paragraph(f"Não foi possível gerar o diagnóstico inteligente: {xml_escape(str(exc))}", body))
+        story.append(Spacer(1, 10))
+        return
+
+    def safe(valor):
+        return xml_escape(str(valor or ""))
+
+    total = diag.get("total_exames_analisados", 0)
+    alteracoes = diag.get("total_alteracoes", 0)
+    alertas_qtd = diag.get("total_alertas_combinados", 0)
+
+    story.append(Paragraph("Diagnóstico nutricional", h2))
+
+    story.append(Paragraph(
+        safe(
+            f"Foram analisados {total} exame(s). "
+            f"A análise identificou {alteracoes} resultado(s) fora da referência laboratorial "
+            f"e {alertas_qtd} alerta(s) combinado(s)."
+        ),
+        body,
+    ))
+    story.append(Spacer(1, 8))
+
+    alertas = diag.get("alertas", []) or []
+
+    if alertas:
+        story.append(Paragraph("Alertas combinados prioritários", h2))
+
+        dados_alertas = [["Alerta", "Possível diagnóstico/alteração", "Conduta sugerida"]]
+
+        for alerta in alertas[:6]:
+            dados_alertas.append([
+                Paragraph(safe(alerta.get("titulo", "")), small),
+                Paragraph(safe(alerta.get("possivel_condicao", "")), small),
+                Paragraph(safe(alerta.get("conduta", "")), small),
+            ])
+
+        tabela_alertas = Table(
+            dados_alertas,
+            colWidths=[4.0 * cm, 5.2 * cm, 7.0 * cm],
+            repeatRows=1,
+        )
+
+        tabela_alertas.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F3F4F6")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#111827")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D1D5DB")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+
+        story.append(tabela_alertas)
+        story.append(Spacer(1, 10))
+
+    story.append(Paragraph(
+        "Nota: este diagnóstico é um apoio técnico nutricional. Não substitui diagnóstico médico, "
+        "avaliação clínica individualizada ou prescrição medicamentosa.",
+        body,
+    ))
+    story.append(Spacer(1, 14))
+# ===== FIM PATCH: DIAGNÓSTICO NUTRICIONAL INTELIGENTE NO PDF NUTRICIONAL =====
 
 
 def resumo_nutricional_view(page):
@@ -7949,43 +8869,6 @@ def gerar_pdf_analise_paciente(paciente):
     story.append(_ns_paragrafo(f"Data de emissão: {datetime.now().strftime('%d/%m/%Y %H:%M')}", body))
     story.append(Spacer(1, 10))
 
-    story.append(Paragraph("Dashboard clínico", h2))
-    story.append(
-        _ns_barra_pdf(
-            "Resumo dos exames",
-            [
-                ("Total", resumo["total"], "#2563EB"),
-                ("Normais", resumo["normais"], "#16A34A"),
-                ("Alterados", resumo["alterados"], "#F59E0B"),
-            ],
-        )
-    )
-
-    tabela_resumo = Table(
-        [
-            [_ns_paragrafo("Indicador", small), _ns_paragrafo("Quantidade", small)],
-            [_ns_paragrafo("Resultados analisados", small), str(resumo["total"])],
-            [_ns_paragrafo("Dentro da referência", small), str(resumo["normais"])],
-            [_ns_paragrafo("Fora da referência", small), str(resumo["alterados"])],
-            [_ns_paragrafo("Sem análise automática", small), str(resumo["sem"])],
-        ],
-        colWidths=[9 * cm, 4 * cm],
-    )
-
-    tabela_resumo.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), HexColor("#F3F4F6")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), HexColor("#111827")),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("GRID", (0, 0), (-1, -1), 0.25, HexColor("#CBD5E1")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("FONTSIZE", (0, 0), (-1, -1), 8),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-    ]))
-
-    story.append(tabela_resumo)
-    story.append(Spacer(1, 12))
-
     story.append(Paragraph("Exames alterados", h2))
 
     if alterados:
@@ -8087,6 +8970,15 @@ def gerar_pdf_analise_paciente(paciente):
 
     story.append(Spacer(1, 12))
 
+    _exames_diag_pdf = (
+        locals().get("exames")
+        or locals().get("exames_paciente")
+        or locals().get("resultados")
+        or locals().get("resultados_exames")
+        or []
+    )
+    _pdf_adicionar_diagnostico_inteligente_nutricao(story, _exames_diag_pdf, h2, body, small)
+    story.append(Spacer(1, 8))
     story.append(Paragraph("Observações importantes", h2))
     story.append(_ns_paragrafo(
         "Este relatório organiza os dados cadastrados no sistema e compara automaticamente os exames com as faixas de referência disponíveis. "
@@ -9231,31 +10123,403 @@ def _nutri_analise_calorica(paciente, anamnese, recordatorio, antro):
     }
 
 
+
+# ===== PATCH: DIAGNÓSTICO NUTRICIONAL INTELIGENTE NA TELA NUTRIÇÃO =====
+
+# ===== PATCH: TABELA DE ANÁLISE DOS EXAMES NA TELA NUTRIÇÃO =====
+def _nutri_texto_tabela(valor, largura, negrito=False):
+    return ft.Container(
+        width=largura,
+        padding=ft.Padding.symmetric(horizontal=4, vertical=4),
+        content=ft.Text(
+            str(valor or ""),
+            size=11,
+            color="#111827",
+            weight=ft.FontWeight.BOLD if negrito else ft.FontWeight.NORMAL,
+        ),
+    )
+
+
+def _nutri_tabela_diagnostico_exames(exames):
+    """
+    Renderiza a análise dos exames em tabela, no mesmo conceito do relatório PDF.
+
+    Substitui os cards soltos de insights por uma visão tabular:
+    Exame | Interpretação | Possível alteração | Conduta | Complementares.
+    """
+    try:
+        from diagnostico_nutricional_inteligente import gerar_diagnostico_inteligente
+    except Exception as exc:
+        return ft.Container(
+            bgcolor="#FFFFFF",
+            border_radius=18,
+            padding=20,
+            content=ft.Text(
+                f"Diagnóstico nutricional indisponível: {exc}",
+                size=13,
+                color="#B91C1C",
+            ),
+        )
+
+    try:
+        diag = gerar_diagnostico_inteligente(exames or [])
+    except Exception as exc:
+        return ft.Container(
+            bgcolor="#FFFFFF",
+            border_radius=18,
+            padding=20,
+            content=ft.Text(
+                f"Não foi possível gerar a análise dos exames: {exc}",
+                size=13,
+                color="#B91C1C",
+            ),
+        )
+
+    total = diag.get("total_exames_analisados", 0)
+    alteracoes = diag.get("total_alteracoes", 0)
+    alertas = diag.get("total_alertas_combinados", 0)
+    sugestoes = diag.get("sugestoes", []) or []
+
+    linhas = []
+
+    if sugestoes:
+        for item in sugestoes:
+            linhas.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(_nutri_texto_tabela(item.get("exame", ""), 125)),
+                        ft.DataCell(_nutri_texto_tabela(item.get("interpretacao", ""), 135)),
+                        ft.DataCell(_nutri_texto_tabela(item.get("possivel_condicao", ""), 220)),
+                        ft.DataCell(_nutri_texto_tabela(item.get("conduta", ""), 260)),
+                        ft.DataCell(_nutri_texto_tabela(item.get("complementares", ""), 210)),
+                    ]
+                )
+            )
+    else:
+        linhas.append(
+            ft.DataRow(
+                cells=[
+                    ft.DataCell(_nutri_texto_tabela("Sem alterações", 125)),
+                    ft.DataCell(_nutri_texto_tabela("Dentro da referência", 135)),
+                    ft.DataCell(_nutri_texto_tabela("Nenhum exame fora da referência laboratorial foi identificado.", 220)),
+                    ft.DataCell(_nutri_texto_tabela("Manter acompanhamento evolutivo conforme sintomas, rotina alimentar e histórico clínico.", 260)),
+                    ft.DataCell(_nutri_texto_tabela("", 210)),
+                ]
+            )
+        )
+
+    tabela = ft.DataTable(
+        heading_row_color="#F3F4F6",
+        data_row_color="#FFFFFF",
+        column_spacing=8,
+        horizontal_margin=8,
+        columns=[
+            ft.DataColumn(_nutri_texto_tabela("Exame", 125, negrito=True)),
+            ft.DataColumn(_nutri_texto_tabela("Interpretação", 135, negrito=True)),
+            ft.DataColumn(_nutri_texto_tabela("Possível alteração", 220, negrito=True)),
+            ft.DataColumn(_nutri_texto_tabela("Conduta / possível tratamento nutricional", 260, negrito=True)),
+            ft.DataColumn(_nutri_texto_tabela("Complementares", 210, negrito=True)),
+        ],
+        rows=linhas,
+    )
+
+    return ft.Container(
+        bgcolor="#FFFFFF",
+        border_radius=18,
+        padding=20,
+        content=ft.Column(
+            spacing=12,
+            controls=[
+                ft.Text(
+                    "Análise dos exames",
+                    size=20,
+                    weight=ft.FontWeight.BOLD,
+                    color="#111827",
+                ),
+                ft.Text(
+                    f"{total} exame(s) analisado(s) • {alteracoes} resultado(s) fora da referência laboratorial • {alertas} alerta(s) combinado(s)",
+                    size=12,
+                    color="#6B7280",
+                ),
+                ft.Container(
+                    bgcolor="#F9FAFB",
+                    border_radius=12,
+                    padding=8,
+                    content=ft.Row(
+                        scroll=ft.ScrollMode.AUTO,
+                        controls=[tabela],
+                    ),
+                ),
+                ft.Text(
+                    "Nota: análise de apoio nutricional. Não substitui avaliação clínica, diagnóstico médico ou prescrição medicamentosa.",
+                    size=11,
+                    color="#6B7280",
+                ),
+            ],
+        ),
+    )
+# ===== FIM PATCH: TABELA DE ANÁLISE DOS EXAMES NA TELA NUTRIÇÃO =====
+
+
+
+# ===== PATCH: CONVERTER INSIGHTS EM TABELA DE ANÁLISE DOS EXAMES =====
+def _nutri_parse_insight_para_linha(texto):
+    """
+    Converte um insight textual do diagnóstico em linha de tabela.
+
+    Esperado:
+    Exame — Interpretação. Possível alteração... Conduta: ... Complementares: ...
+    """
+    texto = str(texto or "").strip().lstrip("•").strip()
+
+    if not texto:
+        return None
+
+    # Ignora resumo, nota e hábitos/anamnese.
+    ignorar = [
+        "Resumo:",
+        "Nota:",
+        "Objetivo/",
+        "Qualidade do sono",
+        "Ingestão hídrica",
+        "Intolerância",
+        "Recordatório",
+        "Refeições",
+        "Diagnóstico nutricional",
+        "Nenhum exame fora",
+    ]
+
+    if any(texto.startswith(prefixo) for prefixo in ignorar):
+        return None
+
+    if "—" not in texto:
+        return None
+
+    exame, resto = texto.split("—", 1)
+    exame = exame.strip()
+    resto = resto.strip()
+
+    interpretacao = ""
+    possivel = ""
+    conduta = ""
+    complementares = ""
+
+    if "." in resto:
+        interpretacao, resto = resto.split(".", 1)
+        interpretacao = interpretacao.strip()
+        resto = resto.strip()
+    else:
+        interpretacao = resto.strip()
+        resto = ""
+
+    if "Conduta:" in resto:
+        possivel, resto = resto.split("Conduta:", 1)
+        possivel = possivel.strip()
+        resto = resto.strip()
+    else:
+        possivel = resto.strip()
+        resto = ""
+
+    if "Complementares:" in resto:
+        conduta, complementares = resto.split("Complementares:", 1)
+        conduta = conduta.strip()
+        complementares = complementares.strip()
+    else:
+        conduta = resto.strip()
+
+    return {
+        "exame": exame,
+        "interpretacao": interpretacao,
+        "possivel": possivel,
+        "conduta": conduta,
+        "complementares": complementares,
+    }
+
+
+def _nutri_cell_tabela(valor, largura, negrito=False):
+    return ft.Container(
+        width=largura,
+        padding=ft.Padding.symmetric(horizontal=4, vertical=5),
+        content=ft.Text(
+            str(valor or ""),
+            size=11,
+            color="#111827",
+            weight=ft.FontWeight.BOLD if negrito else ft.FontWeight.NORMAL,
+        ),
+    )
+
+
+def _nutri_tabela_analise_a_partir_de_insights(itens):
+    """
+    Substitui os cards de insights por uma tabela visual equivalente ao relatório.
+    """
+    itens = list(itens or [])
+
+    linhas_parseadas = []
+
+    for item in itens:
+        linha = _nutri_parse_insight_para_linha(item)
+        if linha:
+            linhas_parseadas.append(linha)
+
+    rows = []
+
+    if linhas_parseadas:
+        for linha in linhas_parseadas:
+            rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(_nutri_cell_tabela(linha["exame"], 130)),
+                        ft.DataCell(_nutri_cell_tabela(linha["interpretacao"], 140)),
+                        ft.DataCell(_nutri_cell_tabela(linha["possivel"], 250)),
+                        ft.DataCell(_nutri_cell_tabela(linha["conduta"], 270)),
+                        ft.DataCell(_nutri_cell_tabela(linha["complementares"], 220)),
+                    ]
+                )
+            )
+    else:
+        rows.append(
+            ft.DataRow(
+                cells=[
+                    ft.DataCell(_nutri_cell_tabela("Sem alterações", 130)),
+                    ft.DataCell(_nutri_cell_tabela("Dentro da referência", 140)),
+                    ft.DataCell(_nutri_cell_tabela("Nenhum exame fora da referência laboratorial foi identificado.", 250)),
+                    ft.DataCell(_nutri_cell_tabela("Manter acompanhamento evolutivo conforme sintomas, rotina alimentar e histórico clínico.", 270)),
+                    ft.DataCell(_nutri_cell_tabela("", 220)),
+                ]
+            )
+        )
+
+    tabela = ft.DataTable(
+        heading_row_color="#F3F4F6",
+        data_row_color="#FFFFFF",
+        column_spacing=8,
+        horizontal_margin=8,
+        columns=[
+            ft.DataColumn(_nutri_cell_tabela("Exame", 130, negrito=True)),
+            ft.DataColumn(_nutri_cell_tabela("Interpretação", 140, negrito=True)),
+            ft.DataColumn(_nutri_cell_tabela("Possível alteração", 250, negrito=True)),
+            ft.DataColumn(_nutri_cell_tabela("Conduta / possível tratamento nutricional", 270, negrito=True)),
+            ft.DataColumn(_nutri_cell_tabela("Complementares", 220, negrito=True)),
+        ],
+        rows=rows,
+    )
+
+    return ft.Container(
+        bgcolor="#FFFFFF",
+        border_radius=18,
+        padding=20,
+        content=ft.Column(
+            spacing=12,
+            controls=[
+                ft.Text(
+                    "Análise dos exames",
+                    size=20,
+                    weight=ft.FontWeight.BOLD,
+                    color="#111827",
+                ),
+                ft.Text(
+                    "Resultados fora da referência laboratorial com interpretação, conduta e complementares.",
+                    size=12,
+                    color="#6B7280",
+                ),
+                ft.Container(
+                    bgcolor="#F9FAFB",
+                    border_radius=12,
+                    padding=8,
+                    content=ft.Row(
+                        scroll=ft.ScrollMode.AUTO,
+                        controls=[tabela],
+                    ),
+                ),
+                ft.Text(
+                    "Nota: análise de apoio nutricional. Não substitui avaliação clínica, diagnóstico médico ou prescrição medicamentosa.",
+                    size=11,
+                    color="#6B7280",
+                ),
+            ],
+        ),
+    )
+# ===== FIM PATCH: CONVERTER INSIGHTS EM TABELA DE ANÁLISE DOS EXAMES =====
+
+
+def _diagnostico_nutricional_inteligente_para_insights(exames):
+    """
+    Converte o diagnóstico nutricional em cards objetivos para a tela Nutrição.
+
+    UX:
+    - Um card por exame alterado.
+    - Texto direto, sem repetir nome do exame dentro da explicação.
+    - Conduta e complementares no mesmo card.
+    """
+    try:
+        from diagnostico_nutricional_inteligente import gerar_diagnostico_inteligente
+    except Exception as exc:
+        return [f"Diagnóstico nutricional indisponível: {exc}"]
+
+    try:
+        diag = gerar_diagnostico_inteligente(exames)
+    except Exception as exc:
+        return [f"Não foi possível gerar o diagnóstico nutricional: {exc}"]
+
+    total = diag.get("total_exames_analisados", 0)
+    alteracoes = diag.get("total_alteracoes", 0)
+    alertas_qtd = diag.get("total_alertas_combinados", 0)
+
+    linhas = [
+        (
+            f"Resumo: {total} exame(s) analisado(s), "
+            f"{alteracoes} resultado(s) fora da referência laboratorial "
+            f"e {alertas_qtd} alerta(s) combinado(s)."
+        )
+    ]
+
+    sugestoes = diag.get("sugestoes", []) or []
+
+    if not sugestoes:
+        linhas.append(
+            "Nenhum exame fora da referência laboratorial foi identificado. "
+            "Manter acompanhamento evolutivo conforme sintomas, rotina alimentar e histórico clínico."
+        )
+        return linhas
+
+    for item in sugestoes[:12]:
+        exame = str(item.get("exame") or "Exame").strip()
+        interpretacao = str(item.get("interpretacao") or "").strip()
+        condicao = str(item.get("possivel_condicao") or "").strip()
+        conduta = str(item.get("conduta") or "").strip()
+        complementares = str(item.get("complementares") or "").strip()
+
+        partes = []
+
+        if condicao:
+            partes.append(condicao)
+
+        if conduta:
+            partes.append(f"Conduta: {conduta}")
+
+        if complementares:
+            partes.append(f"Complementares: {complementares}")
+
+        corpo = " ".join(partes).strip()
+
+        if interpretacao and corpo:
+            linhas.append(f"{exame} — {interpretacao}. {corpo}")
+        elif interpretacao:
+            linhas.append(f"{exame} — {interpretacao}.")
+        elif corpo:
+            linhas.append(f"{exame} — {corpo}")
+
+    linhas.append(
+        "Nota: apoio nutricional. Não substitui avaliação clínica, diagnóstico médico ou prescrição medicamentosa."
+    )
+
+    return linhas
+
+
+
 def _nutri_insights_exames(exames):
-    alterados = [e for e in exames if _nutri_alterado(e.get("status"))]
-    insights = []
-
-    if not alterados:
-        return ["Não foram identificados exames fora da referência automática."]
-
-    for e in alterados:
-        nome = _nutri_nome_exame(e)
-        nome_low = nome.lower()
-        valor = f'{e.get("resultado", "")} {e.get("unidade", "")}'.strip()
-        status = _nutri_status(e.get("status"))
-
-        if "colesterol total" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Avaliar perfil lipídico, fibras, gorduras saturadas, ultraprocessados, peso corporal e risco cardiovascular global.")
-        elif "plaqueta" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Alerta clínico não nutricional isolado; acompanhar histórico, sintomas e avaliação médica.")
-        elif "densidade" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Pode sugerir urina concentrada; cruzar com baixa ingestão hídrica.")
-        elif "bilirrubina" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Achado de menor peso nutricional isolado; avaliar contexto clínico/hepático.")
-        else:
-            insights.append(f"{nome}: {valor} — {status}. Avaliar em conjunto com sinais, sintomas e histórico.")
-
-    return insights
+    return _diagnostico_nutricional_inteligente_para_insights(exames)
 
 
 def _nutri_insights_habitos(anamnese, recordatorio):
@@ -9377,6 +10641,9 @@ def _nutri_bar_chart(titulo, dados, descricao=""):
 
 
 def _nutri_lista(titulo, itens, subtitulo=""):
+    if str(titulo or "").strip() == "Insights de apoio nutricional":
+        return _nutri_tabela_analise_a_partir_de_insights(itens)
+
     controls = [
         ft.Text(titulo, size=18, weight=ft.FontWeight.BOLD, color="#111827"),
     ]
@@ -9540,7 +10807,7 @@ def nutricao_view(page):
             ),
             _nutri_tabela_alterados(alterados),
             _nutri_lista(
-                "Insights principais para a nutricionista",
+                "Insights de apoio nutricional",
                 _nutri_insights_exames(exames) + _nutri_insights_habitos(anamnese, recordatorio),
                 "Leitura integrada de exames, anamnese e recordatório.",
             ),
@@ -10090,30 +11357,7 @@ def _ng_analise_calorica(paciente, anamnese, recordatorio, antro):
 
 
 def _ng_insights_exames(exames):
-    alterados = [e for e in exames if _ng_alterado(e.get("status"))]
-    insights = []
-
-    if not alterados:
-        return ["Não foram identificados exames fora da referência automática."]
-
-    for e in alterados:
-        nome = _ng_nome_exame(e)
-        nome_low = nome.lower()
-        valor = f'{e.get("resultado", "")} {e.get("unidade", "")}'.strip()
-        status = _ng_status(e.get("status"))
-
-        if "colesterol total" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Avaliar fibras, gorduras saturadas, ultraprocessados, peso corporal e risco cardiovascular global.")
-        elif "plaqueta" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Alerta clínico; correlacionar com histórico, sintomas e avaliação médica.")
-        elif "densidade" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Pode sugerir urina concentrada; cruzar com baixa ingestão hídrica.")
-        elif "bilirrubina" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Achado de menor peso nutricional isolado; avaliar contexto clínico/hepático.")
-        else:
-            insights.append(f"{nome}: {valor} — {status}. Avaliar junto aos demais dados clínicos.")
-
-    return insights
+    return _diagnostico_nutricional_inteligente_para_insights(exames)
 
 
 def _ng_insights_habitos(anamnese, recordatorio):
@@ -10234,6 +11478,9 @@ def _ng_bar_chart(titulo, dados, descricao=""):
 
 
 def _ng_lista(titulo, itens, subtitulo=""):
+    if str(titulo or "").strip() == "Insights de apoio nutricional":
+        return _nutri_tabela_analise_a_partir_de_insights(itens)
+
     controls = [ft.Text(titulo, size=18, weight=ft.FontWeight.BOLD, color="#111827")]
 
     if subtitulo:
@@ -10394,7 +11641,7 @@ def nutricao_view(page):
             ),
             _ng_tabela_alterados(alterados),
             _ng_lista(
-                "Insights principais para a nutricionista",
+                "Insights de apoio nutricional",
                 _ng_insights_exames(exames) + _ng_insights_habitos(anamnese, recordatorio),
                 "Leitura integrada de exames, anamnese e recordatório.",
             ),
@@ -10883,28 +12130,7 @@ def _nr_calorias(paciente, anamnese, recordatorio, antro):
 
 
 def _nr_insights_exames(exames):
-    alterados = [e for e in exames if _nr_alterado(e.get("status"))]
-    if not alterados:
-        return ["Não foram identificados exames fora da referência automática."]
-
-    insights = []
-    for e in alterados:
-        nome = _nr_nome_exame(e)
-        nome_low = nome.lower()
-        valor = f'{e.get("resultado", "")} {e.get("unidade", "")}'.strip()
-        status = _nr_status(e.get("status"))
-
-        if "colesterol total" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Avaliar fibras, gorduras saturadas, ultraprocessados, peso corporal e risco cardiovascular global.")
-        elif "plaqueta" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Alerta clínico; correlacionar com histórico, sintomas e avaliação médica.")
-        elif "densidade" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Pode sugerir urina concentrada; cruzar com baixa ingestão hídrica.")
-        elif "bilirrubina" in nome_low:
-            insights.append(f"{nome}: {valor} — {status}. Achado de menor peso nutricional isolado; avaliar contexto clínico/hepático.")
-        else:
-            insights.append(f"{nome}: {valor} — {status}. Avaliar junto aos demais dados clínicos.")
-    return insights
+    return _diagnostico_nutricional_inteligente_para_insights(exames)
 
 
 def _nr_insights_habitos(anamnese, recordatorio):
@@ -11011,6 +12237,9 @@ def _nr_bar_chart(titulo, dados, descricao=""):
 
 
 def _nr_lista(titulo, itens, subtitulo=""):
+    if str(titulo or "").strip() == "Insights de apoio nutricional":
+        return _nutri_tabela_analise_a_partir_de_insights(itens)
+
     controls = [ft.Text(titulo, size=18, weight=ft.FontWeight.BOLD, color="#111827")]
     if subtitulo:
         controls.append(ft.Text(subtitulo, size=13, color="#64748B"))
@@ -11138,7 +12367,7 @@ def _nr_montar_painel(pid, page=None):
         ),
         _nr_tabela_alterados(alterados),
         _nr_lista(
-            "Insights principais para a nutricionista",
+            "Insights de apoio nutricional",
             _nr_insights_exames(exames) + _nr_insights_habitos(anamnese, recordatorio),
             "Leitura integrada de exames, anamnese e recordatório.",
         ),
