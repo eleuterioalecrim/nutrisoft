@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Configuração central dos grupos de exames do NutriSoft.
+Agrupamento de exames do NutriSoft.
 
-Organiza exames por grupos e coloca como primeira opção, dentro de cada grupo,
-os exames marcados no documento de solicitação.
+Regra:
+- A lista de exames deve continuar completa.
+- Os exames são agrupados por categoria.
+- Dentro de cada grupo, os exames prioritários aparecem primeiro.
+- Os demais exames do grupo aparecem depois, em ordem alfabética.
+- A única exclusão permitida é a de exames já cadastrados para o paciente na mesma data.
 """
 
 import unicodedata
@@ -59,118 +63,6 @@ def normalizar_texto(valor):
     return " ".join(texto.split())
 
 
-def identificar_grupo_exame(nome_exame):
-    nome = normalizar_texto(nome_exame)
-
-    for grupo, exames in EXAMES_PRIORITARIOS_POR_GRUPO.items():
-        for exame in exames:
-            if normalizar_texto(exame) == nome:
-                return grupo
-
-    regras = [
-        ("Bioquímica", [
-            "glicose", "creatinina", "ureia", "tgo", "tgp",
-            "colesterol", "triglicerideos", "lipidograma",
-            "hdl", "ldl", "vldl", "ferro", "acido urico",
-            "bilirrubina", "fosfatase", "gama gt", "albumina",
-            "sodio", "potassio", "calcio", "magnesio",
-        ]),
-        ("Hematologia", [
-            "hemograma", "hemoglobina", "hematocrito",
-            "leucocitos", "plaquetas", "vcm", "hcm", "chcm", "rdw",
-        ]),
-        ("Hormônios", [
-            "tsh", "t4", "t3", "insulina", "ferritina",
-            "testosterona", "cortisol", "estradiol",
-            "progesterona", "prolactina", "lh", "fsh",
-        ]),
-        ("Imunologia", [
-            "vitamina b12", "25oh", "vitamina d",
-            "anti", "igg", "igm", "ige", "pcr",
-            "proteina c reativa",
-        ]),
-        ("Urina", [
-            "eas", "urina", "urocultura", "sedimento urinario",
-        ]),
-        ("Fezes", [
-            "fezes", "coprocultura", "parasitologico",
-        ]),
-        ("Microbiologia", [
-            "cultura", "antibiograma", "bacterioscopia", "microbiologia",
-        ]),
-    ]
-
-    for grupo, palavras in regras:
-        for palavra in palavras:
-            if palavra in nome:
-                return grupo
-
-    return "Outros"
-
-
-def listar_grupos_disponiveis(exames=None):
-    if not exames:
-        return GRUPOS_PADRAO
-
-    grupos = []
-    for exame in exames:
-        grupo = identificar_grupo_exame(exame)
-        if grupo not in grupos:
-            grupos.append(grupo)
-
-    return sorted(
-        grupos,
-        key=lambda grupo: GRUPOS_PADRAO.index(grupo)
-        if grupo in GRUPOS_PADRAO else 999
-    )
-
-
-def ordenar_exames_por_prioridade(exames, grupo=None, exames_ja_cadastrados=None):
-    exames = list(exames or [])
-    exames_ja_cadastrados = exames_ja_cadastrados or []
-
-    ja_cadastrados_normalizados = {
-        normalizar_texto(exame)
-        for exame in exames_ja_cadastrados
-    }
-
-    prioritarios = EXAMES_PRIORITARIOS_POR_GRUPO.get(grupo, []) if grupo else []
-
-    ordem_prioritarios = {
-        normalizar_texto(exame): indice
-        for indice, exame in enumerate(prioritarios)
-    }
-
-    exames_filtrados = []
-
-    for exame in exames:
-        exame_texto = str(exame or "").strip()
-
-        if not exame_texto:
-            continue
-
-        exame_normalizado = normalizar_texto(exame_texto)
-
-        if exame_normalizado in ja_cadastrados_normalizados:
-            continue
-
-        grupo_exame = identificar_grupo_exame(exame_texto)
-
-        if grupo and grupo_exame != grupo:
-            continue
-
-        exames_filtrados.append(exame_texto)
-
-    def chave_ordenacao(exame):
-        exame_normalizado = normalizar_texto(exame)
-
-        if exame_normalizado in ordem_prioritarios:
-            return (0, ordem_prioritarios[exame_normalizado], exame_normalizado)
-
-        return (1, 9999, exame_normalizado)
-
-    return sorted(exames_filtrados, key=chave_ordenacao)
-
 def obter_nome_exame_item(item):
     """
     Extrai o nome do exame a partir de string ou dicionário de catálogo.
@@ -181,7 +73,6 @@ def obter_nome_exame_item(item):
             if valor:
                 return str(valor).strip()
 
-        # fallback seguro: usa id se não houver nome
         valor = item.get("id")
         if valor:
             return str(valor).strip()
@@ -189,18 +80,128 @@ def obter_nome_exame_item(item):
     return str(item or "").strip()
 
 
-def ordenar_itens_exames_por_prioridade(itens, grupo=None, exames_ja_cadastrados=None):
+def identificar_grupo_exame(nome_exame):
     """
-    Ordena uma lista de itens de catálogo preservando os objetos originais.
+    Identifica o grupo do exame.
 
-    Diferente de ordenar_exames_por_prioridade(), esta função aceita:
-    - strings;
-    - dicionários do CATALOGO_EXAMES;
-    - qualquer objeto que possa ser convertido para texto.
-
-    Retorna os próprios itens originais, apenas reordenados e filtrados.
+    Primeiro verifica os exames prioritários.
+    Depois usa palavras-chave.
+    Se não encontrar, classifica como Outros.
     """
-    itens = list(itens or [])
+    nome = normalizar_texto(nome_exame)
+
+    for grupo, exames in EXAMES_PRIORITARIOS_POR_GRUPO.items():
+        for exame in exames:
+            if normalizar_texto(exame) == nome:
+                return grupo
+
+    regras = [
+        ("Bioquímica", [
+            "glicose", "creatinina", "ureia", "tgo", "tgp",
+            "colesterol", "triglicerideos", "triglicerídeos",
+            "lipidograma", "hdl", "ldl", "vldl", "ferro",
+            "acido urico", "ácido úrico", "bilirrubina",
+            "fosfatase", "gama gt", "albumina", "proteinas totais",
+            "proteínas totais", "sodio", "sódio", "potassio",
+            "potássio", "calcio", "cálcio", "magnesio", "magnésio",
+        ]),
+        ("Hematologia", [
+            "hemograma", "hemoglobina", "hematocrito", "hematócrito",
+            "leucocitos", "leucócitos", "plaquetas", "vcm", "hcm",
+            "chcm", "rdw", "eritrocitos", "eritrócitos",
+        ]),
+        ("Hormônios", [
+            "tsh", "t4", "t3", "insulina", "ferritina",
+            "testosterona", "cortisol", "estradiol", "progesterona",
+            "prolactina", "lh", "fsh", "dhea",
+        ]),
+        ("Imunologia", [
+            "vitamina b12", "25oh", "vitamina d", "anti", "igg",
+            "igm", "ige", "pcr", "proteina c reativa",
+            "proteína c reativa",
+        ]),
+        ("Urina", [
+            "eas", "e a s", "urina", "urocultura", "sedimento urinario",
+            "sedimento urinário",
+        ]),
+        ("Fezes", [
+            "fezes", "coprocultura", "parasitologico", "parasitológico",
+        ]),
+        ("Microbiologia", [
+            "cultura", "antibiograma", "bacterioscopia", "microbiologia",
+        ]),
+    ]
+
+    for grupo, palavras in regras:
+        for palavra in palavras:
+            if normalizar_texto(palavra) in nome:
+                return grupo
+
+    return "Outros"
+
+
+def identificar_grupo_item(item):
+    """
+    Identifica o grupo de um item de catálogo.
+    Se o dicionário já tiver grupo válido, usa esse grupo.
+    Caso contrário, identifica pelo nome.
+    """
+    if isinstance(item, dict):
+        grupo = str(item.get("grupo") or "").strip()
+        if grupo in GRUPOS_PADRAO:
+            return grupo
+
+    return identificar_grupo_exame(obter_nome_exame_item(item))
+
+
+def listar_grupos_disponiveis(exames=None):
+    if not exames:
+        return GRUPOS_PADRAO
+
+    grupos = []
+
+    for exame in exames:
+        grupo = identificar_grupo_item(exame)
+        if grupo not in grupos:
+            grupos.append(grupo)
+
+    return sorted(
+        grupos,
+        key=lambda grupo: GRUPOS_PADRAO.index(grupo)
+        if grupo in GRUPOS_PADRAO else 999
+    )
+
+
+def ordem_prioridade_no_grupo(nome_exame, grupo):
+    prioritarios = EXAMES_PRIORITARIOS_POR_GRUPO.get(grupo, [])
+    nome_normalizado = normalizar_texto(nome_exame)
+
+    for indice, exame_prioritario in enumerate(prioritarios):
+        if normalizar_texto(exame_prioritario) == nome_normalizado:
+            return indice
+
+    return None
+
+
+def ordenar_exames_por_prioridade(exames, grupo=None, exames_ja_cadastrados=None):
+    """
+    Ordena nomes de exames mantendo a lista completa.
+
+    Se grupo for informado:
+    - retorna todos os exames daquele grupo;
+    - prioritários primeiro;
+    - demais depois em ordem alfabética.
+
+    Se grupo não for informado:
+    - retorna todos os exames;
+    - agrupados por grupo;
+    - dentro de cada grupo, prioritários primeiro;
+    - demais depois em ordem alfabética.
+
+    Não remove exames comuns.
+    Remove apenas exames já cadastrados, quando exames_ja_cadastrados for informado.
+    """
+    exames = list(exames or [])
     exames_ja_cadastrados = exames_ja_cadastrados or []
 
     ja_cadastrados_normalizados = {
@@ -208,11 +209,59 @@ def ordenar_itens_exames_por_prioridade(itens, grupo=None, exames_ja_cadastrados
         for exame in exames_ja_cadastrados
     }
 
-    prioritarios = EXAMES_PRIORITARIOS_POR_GRUPO.get(grupo, []) if grupo else []
+    filtrados = []
 
-    ordem_prioritarios = {
-        normalizar_texto(exame): indice
-        for indice, exame in enumerate(prioritarios)
+    for exame in exames:
+        nome = obter_nome_exame_item(exame)
+
+        if not nome:
+            continue
+
+        if normalizar_texto(nome) in ja_cadastrados_normalizados:
+            continue
+
+        grupo_exame = identificar_grupo_exame(nome)
+
+        if grupo and grupo_exame != grupo:
+            continue
+
+        filtrados.append(nome)
+
+    def chave_ordenacao(nome):
+        grupo_exame = identificar_grupo_exame(nome)
+        grupo_rank = (
+            GRUPOS_PADRAO.index(grupo_exame)
+            if grupo_exame in GRUPOS_PADRAO
+            else 999
+        )
+
+        prioridade = ordem_prioridade_no_grupo(nome, grupo_exame)
+
+        if prioridade is not None:
+            return (grupo_rank, 0, prioridade, normalizar_texto(nome))
+
+        return (grupo_rank, 1, 9999, normalizar_texto(nome))
+
+    return sorted(filtrados, key=chave_ordenacao)
+
+
+def ordenar_itens_exames_por_prioridade(itens, grupo=None, exames_ja_cadastrados=None):
+    """
+    Ordena itens de catálogo preservando os objetos originais.
+
+    Aceita:
+    - strings;
+    - dicionários do CATALOGO_EXAMES;
+    - objetos convertíveis para texto.
+
+    Mantém todos os exames, exceto os já cadastrados quando informados.
+    """
+    itens = list(itens or [])
+    exames_ja_cadastrados = exames_ja_cadastrados or []
+
+    ja_cadastrados_normalizados = {
+        normalizar_texto(obter_nome_exame_item(exame))
+        for exame in exames_ja_cadastrados
     }
 
     filtrados = []
@@ -223,26 +272,31 @@ def ordenar_itens_exames_por_prioridade(itens, grupo=None, exames_ja_cadastrados
         if not nome:
             continue
 
-        nome_normalizado = normalizar_texto(nome)
-
-        if nome_normalizado in ja_cadastrados_normalizados:
+        if normalizar_texto(nome) in ja_cadastrados_normalizados:
             continue
 
-        grupo_exame = identificar_grupo_exame(nome)
+        grupo_item = identificar_grupo_item(item)
 
-        if grupo and grupo_exame != grupo:
+        if grupo and grupo_item != grupo:
             continue
 
         filtrados.append(item)
 
     def chave_ordenacao(item):
         nome = obter_nome_exame_item(item)
-        nome_normalizado = normalizar_texto(nome)
+        grupo_item = identificar_grupo_item(item)
 
-        if nome_normalizado in ordem_prioritarios:
-            return (0, ordem_prioritarios[nome_normalizado], nome_normalizado)
+        grupo_rank = (
+            GRUPOS_PADRAO.index(grupo_item)
+            if grupo_item in GRUPOS_PADRAO
+            else 999
+        )
 
-        return (1, 9999, nome_normalizado)
+        prioridade = ordem_prioridade_no_grupo(nome, grupo_item)
+
+        if prioridade is not None:
+            return (grupo_rank, 0, prioridade, normalizar_texto(nome))
+
+        return (grupo_rank, 1, 9999, normalizar_texto(nome))
 
     return sorted(filtrados, key=chave_ordenacao)
-
