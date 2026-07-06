@@ -49,3 +49,27 @@ Thumbs.db
 
 # Backups locais gerados em patches
 *.bak_*
+
+# Dados reais / sensíveis do NutriSoft
+data_flet/
+backups/
+logs/
+relatorios/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Sistemas
+.DS_Store
+Thumbs.db
+
+# Builds locais
+dist/
+build/
+dist_windows/

@@ -2995,33 +2995,77 @@ def exame_disponivel_card(page, exame, data_exame_control, paciente_control, atu
                 mostrar_snackbar(page, "Informe o resultado do exame.", COR_ALERTA)
                 return
 
+            item_resultado = {
+                "paciente_id": paciente_id,
+                "paciente_nome": nome_paciente_por_id(paciente_id),
+                "data": data_exame,
+                "data_exame": data_exame,
+                "exame_id": exame["id"],
+                "nome_exame": exame["nome"],
+                "nome": exame["nome"],
+                "exame": exame["nome"],
+                "exame_nome": exame["nome"],
+                "grupo": detalhe_ref_popup["grupo"],
+                "resultado": valor,
+                "unidade": unidade.value,
+                "referencia": detalhe_ref_popup["referencia"],
+                "referencia_texto": detalhe_ref_popup["referencia"],
+                "fonte": detalhe_ref_popup["fonte"],
+                "fonte_referencia": detalhe_ref_popup["fonte"],
+                "observacao": observacao.value or "",
+                "observacoes": observacao.value or "",
+            }
+
+            persistiu = salvar_resultado_exame_csv_definitivo(item_resultado)
+
+            if not persistiu:
+                mostrar_snackbar(
+                    page,
+                    f'Não foi possível salvar o exame "{exame["nome"]}" nos arquivos CSV.',
+                    COR_CRITICO,
+                )
+                return
+
+            status_resultado = item_resultado.get("status") or analisar_resultado_por_referencia(
+                valor,
+                detalhe_ref_popup["referencia"],
+            )
+
             if chave not in EXAMES_CADASTRADOS_MOCK:
                 EXAMES_CADASTRADOS_MOCK[chave] = []
 
             if exame["id"] not in EXAMES_CADASTRADOS_MOCK[chave]:
                 EXAMES_CADASTRADOS_MOCK[chave].append(exame["id"])
 
-            status_resultado = analisar_resultado_por_referencia(valor, detalhe_ref_popup["referencia"])
+            # Mantém a memória visual atualizada, mas não depende mais do append para gravar no CSV.
+            try:
+                ja_memoria = False
+                for r in list(RESULTADOS_EXAMES_MOCK):
+                    mesmo_paciente = str(r.get("paciente_id", "")).zfill(4) == str(paciente_id).zfill(4)
+                    mesmo_exame = str(r.get("nome_exame") or r.get("exame_nome") or r.get("nome") or "") == exame["nome"]
+                    mesmo_data = str(r.get("data_exame") or r.get("data") or "") == data_exame
+                    mesmo_resultado = str(r.get("resultado") or "") == str(valor)
+                    if mesmo_paciente and mesmo_exame and mesmo_data and mesmo_resultado:
+                        ja_memoria = True
+                        break
 
-            RESULTADOS_EXAMES_MOCK.append(
-                {
-                    "paciente_id": paciente_id,
-                    "paciente_nome": nome_paciente_por_id(paciente_id),
-                    "data": data_exame,
-                    "exame_id": exame["id"],
-                    "exame_nome": exame["nome"],
-                    "grupo": detalhe_ref_popup["grupo"],
-                    "resultado": valor,
-                    "unidade": unidade.value,
-                    "referencia": detalhe_ref_popup["referencia"],
-                    "fonte": detalhe_ref_popup["fonte"],
-                    "status": status_resultado,
-                    "observacao": observacao.value or "",
-                }
-            )
+                if not ja_memoria:
+                    list.append(RESULTADOS_EXAMES_MOCK, item_resultado)
+            except Exception as exc:
+                print(f"[SALVAR EXAME DEFINITIVO] Exame salvo, mas falhou atualização da memória: {exc}")
+
+            try:
+                sincronizar_resultados_exames_mock_data_flet()
+                atualizar_pacientes_csv_real_definitivo()
+            except Exception as exc:
+                print(f"[SALVAR EXAME DEFINITIVO] Exame salvo, mas falhou atualização pós-salvamento: {exc}")
 
             dialog.open = False
-            mostrar_snackbar(page, f'Protótipo: "{exame["nome"]}" salvo como {status_resultado}.', cor_resultado_exame(status_resultado))
+            mostrar_snackbar(
+                page,
+                f'"{exame["nome"]}" salvo como {status_resultado}.',
+                cor_resultado_exame(status_resultado),
+            )
 
             if atualizar_callback:
                 atualizar_callback()
@@ -3825,6 +3869,236 @@ def exames_view(page):
 
     resumo_texto = ft.Text("", size=13, color=COR_TEXTO_FRACO)
 
+    # ===== PATCH BUSCA INTELIGENTE NA TELA DE EXAMES =====
+
+    busca_exame = ft.TextField(
+        label="Busca inteligente de exame",
+        hint_text="Digite: glicose, hba1c, colesterol, triglicerídeos, creatinina, vitamina D...",
+        border_radius=12,
+        expand=True,
+    )
+
+    busca_resultados_area = ft.Column(spacing=10)
+
+    def _busca_norm(valor):
+        try:
+            return _patch_norm(valor)
+        except Exception:
+            import unicodedata
+            texto = str(valor or "").strip().lower()
+            texto = unicodedata.normalize("NFKD", texto)
+            texto = "".join(c for c in texto if not unicodedata.combining(c))
+            texto = re.sub(r"[^a-z0-9%/., ]+", " ", texto)
+            return " ".join(texto.split())
+
+    def _busca_nome_exame(item):
+        if not isinstance(item, dict):
+            return str(item or "")
+
+        try:
+            return nome_exame_para_exibicao(item)
+        except Exception:
+            return str(
+                item.get("nome_exame")
+                or item.get("nome")
+                or item.get("exame")
+                or item.get("descricao")
+                or item.get("id")
+                or ""
+            ).strip()
+
+    def _busca_termos_exame(item):
+        nome = _busca_nome_exame(item)
+        grupo = ""
+        ref = ""
+        fonte = ""
+        item_id = ""
+
+        if isinstance(item, dict):
+            grupo = str(item.get("grupo") or "")
+            ref = str(item.get("referencia") or item.get("referencia_texto") or "")
+            fonte = str(item.get("fonte") or item.get("fonte_referencia") or "")
+            item_id = str(item.get("id") or item.get("id_canonico") or "")
+
+        termos = {
+            nome,
+            grupo,
+            ref,
+            fonte,
+            item_id,
+        }
+
+        # Aliases úteis para busca rápida.
+        aliases = {
+            "hba1c": ["hemoglobina glicada"],
+            "glicada": ["hemoglobina glicada"],
+            "glico": ["glicose", "hemoglobina glicada", "glicemia media estimada"],
+            "glicemia": ["glicose", "glicemia media estimada"],
+            "glucose": ["glicose"],
+            "colest": ["colesterol total", "hdl", "ldl", "vldl"],
+            "colesterol": ["colesterol total", "hdl", "ldl", "vldl"],
+            "trig": ["triglicerideos", "triglicerides"],
+            "creat": ["creatinina", "tfg"],
+            "renal": ["creatinina", "ureia", "tfg", "acido urico"],
+            "figado": ["tgo", "tgp", "gama gt", "fosfatase alcalina", "bilirrubina"],
+            "hepatico": ["tgo", "tgp", "gama gt", "fosfatase alcalina", "bilirrubina"],
+            "vit d": ["vitamina d"],
+            "vitamina d": ["vitamina d"],
+            "b12": ["vitamina b12"],
+            "ferro": ["ferro", "ferritina", "transferrina"],
+            "ferr": ["ferritina", "ferro"],
+            "tireoide": ["tsh", "t4 livre", "t3 livre"],
+            "tsh": ["tsh"],
+            "hemograma": ["hemograma", "hemoglobina", "hemacias", "leucocitos", "plaquetas"],
+            "plaqueta": ["plaquetas"],
+            "inflamacao": ["proteina c reativa", "pcr", "vhs"],
+            "pcr": ["proteina c reativa"],
+        }
+
+        nome_n = _busca_norm(nome)
+
+        for chave, valores in aliases.items():
+            for valor in valores:
+                if valor in nome_n or nome_n in valor:
+                    termos.add(chave)
+                    termos.add(valor)
+
+        return " ".join(_busca_norm(t) for t in termos if t)
+
+    def _busca_score(item, consulta):
+        nome = _busca_norm(_busca_nome_exame(item))
+        termos = _busca_termos_exame(item)
+        q = _busca_norm(consulta)
+
+        if not q:
+            return 0
+
+        score = 0
+
+        if nome == q:
+            score += 100
+        if nome.startswith(q):
+            score += 80
+        if q in nome:
+            score += 60
+        if q in termos:
+            score += 40
+
+        partes = [p for p in q.split() if len(p) >= 2]
+        for parte in partes:
+            if nome.startswith(parte):
+                score += 18
+            elif parte in nome:
+                score += 12
+            elif parte in termos:
+                score += 8
+
+        return score
+
+    def atualizar_busca_exames(e=None, refresh_page=True):
+        termo = str(busca_exame.value or "").strip()
+
+        if len(termo) < 3:
+            busca_resultados_area.controls = [
+                ft.Container(
+                    padding=12,
+                    border_radius=12,
+                    bgcolor="#F8FAFC",
+                    content=ft.Text(
+                        "Digite pelo menos 3 letras para localizar rapidamente o exame.",
+                        size=12,
+                        color=COR_TEXTO_FRACO,
+                    ),
+                )
+            ]
+            if refresh_page:
+                page.update()
+            return
+
+        data_br = str(data_exame.value or "").strip()
+        data = data_br_para_iso(data_br)
+        paciente_id = paciente_nome.value
+
+        disponiveis = exames_disponiveis_por_data(paciente_id, data)
+
+        encontrados = []
+        for exame in disponiveis:
+            score = _busca_score(exame, termo)
+            if score > 0:
+                encontrados.append((score, exame))
+
+        encontrados.sort(
+            key=lambda x: (
+                -x[0],
+                _busca_norm(_busca_nome_exame(x[1])),
+            )
+        )
+
+        encontrados = [exame for _, exame in encontrados[:8]]
+
+        if not encontrados:
+            busca_resultados_area.controls = [
+                ft.Container(
+                    padding=12,
+                    border_radius=12,
+                    bgcolor="#FEF2F2",
+                    content=ft.Text(
+                        "Nenhum exame disponível encontrado para essa busca. Verifique se ele já foi cadastrado nesta data.",
+                        size=12,
+                        color="#991B1B",
+                    ),
+                )
+            ]
+        else:
+            busca_resultados_area.controls = [
+                ft.Text(
+                    f"{len(encontrados)} resultado(s) encontrado(s)",
+                    size=12,
+                    color=COR_TEXTO_FRACO,
+                )
+            ] + [
+                exame_disponivel_card(
+                    page,
+                    exame,
+                    data_exame,
+                    paciente_nome,
+                    atualizar_callback=atualizar_listas,
+                )
+                for exame in encontrados
+            ]
+
+        if refresh_page:
+            page.update()
+
+    def limpar_busca_exames(e=None):
+        busca_exame.value = ""
+        atualizar_busca_exames(refresh_page=False)
+        page.update()
+
+    busca_exames_bloco = ft.Container(
+        padding=14,
+        border_radius=16,
+        bgcolor="#F8FAFC",
+        content=ft.Column(
+            spacing=10,
+            controls=[
+                ft.Row(
+                    spacing=10,
+                    controls=[
+                        busca_exame,
+                        ft.OutlinedButton(
+                            content="Limpar",
+                            on_click=limpar_busca_exames,
+                        ),
+                    ],
+                ),
+                busca_resultados_area,
+            ],
+        ),
+    )
+
+    # ===== FIM PATCH BUSCA INTELIGENTE NA TELA DE EXAMES =====
+
     def atualizar_listas(e=None):
         data_br = data_exame.value.strip()
         data = data_br_para_iso(data_br)
@@ -3858,7 +4132,16 @@ def exames_view(page):
                 )
             ]
 
-        lista_bloqueados.controls = [exame_bloqueado_card(exame) for exame in bloqueados]
+        lista_bloqueados.controls = [
+            exame_bloqueado_card_com_exclusao(
+                page,
+                exame,
+                paciente_id,
+                data,
+                atualizar_callback=atualizar_listas,
+            )
+            for exame in bloqueados
+        ]
 
         if not lista_bloqueados.controls:
             lista_bloqueados.controls = [
@@ -3873,10 +4156,16 @@ def exames_view(page):
         resumo_texto.value = f'{len(disponiveis)} exame(s) disponível(is) para cadastro • {len(bloqueados)} já cadastrado(s) nesta data'
         historico_resultados_area.controls = [historico_resultados_card(paciente_id, data)]
 
+        try:
+            atualizar_busca_exames(refresh_page=False)
+        except Exception as exc:
+            print(f"[BUSCA EXAMES] Falha ao atualizar busca: {exc}")
+
         page.update()
 
     data_exame.on_change = atualizar_listas
     paciente_nome.on_change = atualizar_listas
+    busca_exame.on_change = atualizar_busca_exames
 
     atualizar_listas()
 
@@ -3952,6 +4241,7 @@ def exames_view(page):
                                             ft.Text("Cards macro com exames individuais", size=12, color=COR_TEXTO_FRACO),
                                         ],
                                     ),
+                                    busca_exames_bloco,
                                     lista_disponiveis,
                                 ],
                             ),
@@ -18846,8 +19136,5125 @@ def _ed3_criar_controle(page, nome_csv, campo, valor):
     return _ed3_criar_controle_original_v4(page, nome_csv, campo, valor)
 
 
+
+
+# ===== PATCH SEGURO DATA_FLET: EXAMES ANALISE EXCLUSAO =====
+
+from pathlib import Path as _patch_Path
+import csv as _patch_csv
+import unicodedata as _patch_unicodedata
+import re as _patch_re
+from datetime import datetime as _patch_datetime
+
+
+def _patch_data_dir():
+    return _patch_Path(__file__).resolve().parent / "data_flet"
+
+
+def _patch_limpar_chave(chave):
+    return str(chave or "").replace("\ufeff", "").strip()
+
+
+def _patch_row(row):
+    if not isinstance(row, dict):
+        return {}
+    return {
+        _patch_limpar_chave(k): "" if v is None else str(v).strip()
+        for k, v in row.items()
+    }
+
+
+def _patch_get(row, *chaves):
+    r = _patch_row(row)
+    for chave in chaves:
+        chave = _patch_limpar_chave(chave)
+        valor = r.get(chave, "")
+        if str(valor).strip() != "":
+            return str(valor).strip()
+    return ""
+
+
+def _patch_norm(valor):
+    texto = str(valor or "").strip().lower()
+    texto = _patch_unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not _patch_unicodedata.combining(c))
+    texto = texto.replace("_", " ").replace("-", " ")
+    texto = _patch_re.sub(r"[^a-z0-9%/., ]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def _patch_float(valor):
+    texto = str(valor or "").strip()
+    if not texto:
+        return None
+
+    texto = texto.replace(" ", "")
+
+    if "," in texto and "." in texto:
+        texto = texto.replace(".", "").replace(",", ".")
+    else:
+        texto = texto.replace(",", ".")
+
+    m = _patch_re.search(r"[-+]?\d+(?:\.\d+)?", texto)
+    if not m:
+        return None
+
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
+def _patch_ler_csv(nome):
+    caminho = _patch_data_dir() / nome
+    if not caminho.exists():
+        return []
+
+    with open(caminho, newline="", encoding="utf-8-sig") as f:
+        return [_patch_row(r) for r in _patch_csv.DictReader(f)]
+
+
+def _patch_campos_csv(nome, fallback=None):
+    caminho = _patch_data_dir() / nome
+
+    if caminho.exists():
+        try:
+            with open(caminho, newline="", encoding="utf-8-sig") as f:
+                reader = _patch_csv.DictReader(f)
+                campos = [_patch_limpar_chave(c) for c in (reader.fieldnames or [])]
+                if campos:
+                    return campos
+        except Exception:
+            pass
+
+    return list(fallback or [])
+
+
+def _patch_salvar_csv(nome, rows, campos=None):
+    caminho = _patch_data_dir() / nome
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+
+    campos = [_patch_limpar_chave(c) for c in (campos or _patch_campos_csv(nome))]
+
+    for row in rows:
+        for k in _patch_row(row).keys():
+            if k not in campos:
+                campos.append(k)
+
+    if not campos:
+        return
+
+    tmp = caminho.with_suffix(caminho.suffix + ".tmp")
+
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        writer = _patch_csv.DictWriter(f, fieldnames=campos, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            row = _patch_row(row)
+            writer.writerow({c: row.get(c, "") for c in campos})
+
+    tmp.replace(caminho)
+
+
+def _patch_pacientes():
+    pacientes = _patch_ler_csv("pacientes.csv")
+    por_id = {}
+    por_nome = {}
+
+    for p in pacientes:
+        pid = _patch_get(p, "paciente_id", "id")
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+
+        nome = _patch_get(p, "nome", "paciente_nome", "paciente")
+
+        if pid:
+            por_id[pid] = p
+        if nome:
+            por_nome[_patch_norm(nome)] = p
+
+    return pacientes, por_id, por_nome
+
+
+def _patch_pid(row):
+    _, por_id, por_nome = _patch_pacientes()
+
+    pid = _patch_get(row, "paciente_id", "id_paciente")
+    if pid.isdigit() and len(pid) < 4:
+        pid = pid.zfill(4)
+
+    if pid in por_id:
+        return pid
+
+    nome = _patch_get(row, "paciente_nome", "nome_paciente", "paciente", "nome")
+    if nome:
+        p = por_nome.get(_patch_norm(nome))
+        if p:
+            pid = _patch_get(p, "paciente_id", "id")
+            if pid.isdigit() and len(pid) < 4:
+                pid = pid.zfill(4)
+            return pid
+
+    selecionado = str(globals().get("PACIENTE_SELECIONADO_ID", "") or "").strip()
+    if selecionado.isdigit() and len(selecionado) < 4:
+        selecionado = selecionado.zfill(4)
+
+    if selecionado in por_id:
+        return selecionado
+
+    return ""
+
+
+def _patch_nome_paciente(pid):
+    _, por_id, _ = _patch_pacientes()
+    p = por_id.get(str(pid or "").strip(), {})
+    return _patch_get(p, "nome", "paciente_nome", "paciente")
+
+
+def _patch_nome_exame(row):
+    return (
+        _patch_get(row, "nome_exame")
+        or _patch_get(row, "exame")
+        or _patch_get(row, "exame_nome")
+        or _patch_get(row, "tipo_exame")
+        or _patch_get(row, "nome_padronizado")
+    )
+
+
+def _patch_data_exame(row):
+    return (
+        _patch_get(row, "data_exame")
+        or _patch_get(row, "data")
+        or _patch_datetime.now().strftime("%Y-%m-%d")
+    )
+
+
+def _patch_refs():
+    refs = {}
+
+    for r in _patch_ler_csv("referencias_exames.csv"):
+        for nome in [
+            _patch_get(r, "nome_exame"),
+            _patch_get(r, "nome"),
+            _patch_get(r, "id"),
+        ]:
+            n = _patch_norm(nome)
+            if n:
+                refs[n] = r
+
+    return refs
+
+
+def _patch_ref(nome_exame, refs=None):
+    refs = refs or _patch_refs()
+    chave = _patch_norm(nome_exame)
+
+    if chave in refs:
+        return refs[chave]
+
+    for k, r in refs.items():
+        if chave and (chave in k or k in chave):
+            return r
+
+    return {}
+
+
+def _patch_referencia_texto(ref, unidade=""):
+    texto = _patch_get(ref, "referencia_texto") or _patch_get(ref, "referencia")
+    if texto:
+        return texto
+
+    vmin = _patch_get(ref, "valor_min")
+    vmax = _patch_get(ref, "valor_max")
+    unidade = unidade or _patch_get(ref, "unidade")
+
+    if vmin and vmax:
+        return f"{vmin} a {vmax} {unidade}".strip()
+    if vmin:
+        return f">= {vmin} {unidade}".strip()
+    if vmax:
+        return f"<= {vmax} {unidade}".strip()
+
+    return ""
+
+
+def _patch_analisar(nome_exame, resultado, unidade, refs=None):
+    refs = refs or _patch_refs()
+    ref = _patch_ref(nome_exame, refs)
+
+    if not ref:
+        return {
+            "nome_padronizado": nome_exame,
+            "valor_min": "",
+            "valor_max": "",
+            "status": "Sem análise",
+            "mensagem": f"{nome_exame}: referência não localizada no catálogo.",
+            "fonte_referencia": "",
+        }
+
+    valor = _patch_float(resultado)
+    vmin = _patch_float(_patch_get(ref, "valor_min"))
+    vmax = _patch_float(_patch_get(ref, "valor_max"))
+
+    if valor is None:
+        status = "Sem análise"
+    elif vmin is not None and valor < vmin:
+        status = "Baixo"
+    elif vmax is not None and valor > vmax:
+        status = "Alto"
+    elif vmin is not None or vmax is not None:
+        status = "Normal"
+    else:
+        status = "Sem análise"
+
+    nome_pad = _patch_get(ref, "nome_exame") or _patch_get(ref, "nome") or nome_exame
+    referencia = _patch_referencia_texto(ref, unidade)
+
+    msg = f"{nome_pad}: {resultado} {unidade}".strip()
+    msg += f" - {status}"
+    if referencia:
+        msg += f". Referência: {referencia}"
+
+    return {
+        "nome_padronizado": nome_pad,
+        "valor_min": _patch_get(ref, "valor_min"),
+        "valor_max": _patch_get(ref, "valor_max"),
+        "status": status,
+        "mensagem": msg,
+        "fonte_referencia": _patch_get(ref, "fonte_referencia") or _patch_get(ref, "fonte"),
+    }
+
+
+def _patch_chave(row):
+    pid = _patch_pid(row) or _patch_get(row, "paciente_id", "id_paciente")
+    if pid.isdigit() and len(pid) < 4:
+        pid = pid.zfill(4)
+
+    return (
+        pid,
+        _patch_norm(_patch_data_exame(row)),
+        _patch_norm(_patch_nome_exame(row)),
+        _patch_norm(_patch_get(row, "resultado", "valor")),
+        _patch_norm(_patch_get(row, "unidade")),
+    )
+
+
+def _patch_proximo_id(rows, campo, largura=0):
+    maior = 0
+
+    for r in rows:
+        valor = _patch_get(r, campo)
+        m = _patch_re.search(r"\d+", str(valor or ""))
+        if m:
+            try:
+                maior = max(maior, int(m.group(0)))
+            except Exception:
+                pass
+
+    novo = maior + 1
+    return str(novo).zfill(largura) if largura else str(novo)
+
+
+def _patch_migrar_mock_para_csv():
+    mocks = list(globals().get("RESULTADOS_EXAMES_MOCK", []) or [])
+    if not mocks:
+        return 0
+
+    exames = _patch_ler_csv("exames.csv")
+    analises = _patch_ler_csv("analise_exames.csv")
+    refs = _patch_refs()
+
+    chaves_exames = {_patch_chave(r) for r in exames}
+    chaves_analises = {_patch_chave(r) for r in analises}
+
+    adicionados = 0
+
+    for m in mocks:
+        pid = _patch_pid(m)
+        nome_exame = _patch_nome_exame(m)
+        resultado = _patch_get(m, "resultado", "valor")
+        unidade = _patch_get(m, "unidade")
+        data_exame = _patch_data_exame(m)
+
+        if not pid or not nome_exame or not resultado:
+            continue
+
+        chave = (
+            pid,
+            _patch_norm(data_exame),
+            _patch_norm(nome_exame),
+            _patch_norm(resultado),
+            _patch_norm(unidade),
+        )
+
+        if chave not in chaves_exames:
+            exames.append({
+                "exame_id": _patch_proximo_id(exames, "exame_id", 4),
+                "paciente_id": pid,
+                "data_exame": data_exame,
+                "nome_exame": nome_exame,
+                "resultado": resultado,
+                "unidade": unidade,
+                "observacoes": _patch_get(m, "observacoes", "obs") or "Lançado pela interface NutriSoft",
+            })
+            chaves_exames.add(chave)
+            adicionados += 1
+
+        if chave not in chaves_analises:
+            analise = _patch_analisar(nome_exame, resultado, unidade, refs)
+            analises.append({
+                "analise_id": _patch_proximo_id(analises, "analise_id"),
+                "paciente_id": pid,
+                "data_exame": data_exame,
+                "nome_exame": nome_exame,
+                "nome_padronizado": analise["nome_padronizado"],
+                "resultado": resultado,
+                "unidade": unidade,
+                "valor_min": analise["valor_min"],
+                "valor_max": analise["valor_max"],
+                "status": analise["status"],
+                "mensagem": analise["mensagem"],
+                "fonte_referencia": analise["fonte_referencia"],
+            })
+            chaves_analises.add(chave)
+
+    if adicionados:
+        _patch_salvar_csv(
+            "exames.csv",
+            exames,
+            [
+                "exame_id", "paciente_id", "data_exame",
+                "nome_exame", "resultado", "unidade", "observacoes",
+            ],
+        )
+
+        _patch_salvar_csv(
+            "analise_exames.csv",
+            analises,
+            [
+                "analise_id", "paciente_id", "data_exame", "nome_exame",
+                "nome_padronizado", "resultado", "unidade", "valor_min",
+                "valor_max", "status", "mensagem", "fonte_referencia",
+            ],
+        )
+
+        print(f"[PATCH DATA_FLET] Resultados migrados para CSV: {adicionados}")
+
+    return adicionados
+
+
+def sincronizar_resultados_exames_mock_data_flet():
+    _patch_migrar_mock_para_csv()
+
+    analises = _patch_ler_csv("analise_exames.csv")
+    refs = _patch_refs()
+    resultados = []
+
+    for r in analises:
+        pid = _patch_get(r, "paciente_id", "id_paciente")
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+
+        nome_exame = _patch_nome_exame(r)
+        unidade = _patch_get(r, "unidade")
+        resultado = _patch_get(r, "resultado", "valor")
+        data_exame = _patch_data_exame(r)
+
+        ref = _patch_ref(nome_exame, refs)
+        referencia = _patch_referencia_texto(ref, unidade)
+
+        status = _patch_get(r, "status")
+        if not status:
+            status = _patch_analisar(nome_exame, resultado, unidade, refs)["status"]
+
+        item = dict(r)
+        item.update({
+            "paciente_id": pid,
+            "id_paciente": pid,
+            "paciente": _patch_nome_paciente(pid),
+            "paciente_nome": _patch_nome_paciente(pid),
+            "data": data_exame,
+            "data_exame": data_exame,
+            "exame": nome_exame,
+            "nome_exame": nome_exame,
+            "nome_padronizado": _patch_get(r, "nome_padronizado") or nome_exame,
+            "resultado": resultado,
+            "unidade": unidade,
+            "referencia": referencia,
+            "referencia_texto": referencia,
+            "status": status,
+            "mensagem": _patch_get(r, "mensagem"),
+            "fonte_referencia": _patch_get(r, "fonte_referencia"),
+        })
+
+        resultados.append(item)
+
+    globals()["RESULTADOS_EXAMES_MOCK"] = resultados
+
+    # EXAMES_CADASTRADOS_MOCK precisa continuar sendo dict.
+    # A tela de cadastro usa EXAMES_CADASTRADOS_MOCK.get((paciente_id, data), [])
+    # para esconder exames já lançados naquela data.
+    cadastrados = {}
+    for item in resultados:
+        pid = _patch_get(item, "paciente_id", "id_paciente")
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+
+        data = _patch_data_exame(item)
+        nome_exame = _patch_nome_exame(item)
+
+        if not pid or not data or not nome_exame:
+            continue
+
+        chaves = [
+            (pid, data),
+            (str(pid), data),
+        ]
+
+        for chave in chaves:
+            cadastrados.setdefault(chave, [])
+            if nome_exame not in cadastrados[chave]:
+                cadastrados[chave].append(nome_exame)
+
+    globals()["EXAMES_CADASTRADOS_MOCK"] = cadastrados
+
+    print(f"[PATCH DATA_FLET] Resultados sincronizados: {len(resultados)}")
+    print(f"[PATCH DATA_FLET] Datas com exames cadastrados: {len(cadastrados)}")
+    return resultados
+
+
+def _patch_status_paciente(exames):
+    if not exames:
+        return "Sem exames"
+
+    status = [_patch_norm(_patch_get(e, "status")) for e in exames]
+
+    if any("critico" in s for s in status):
+        return "Crítico"
+    if any("alto" in s or "baixo" in s or "alterado" in s for s in status):
+        return "Atenção"
+    if any("normal" in s for s in status):
+        return "Normal"
+
+    return "Sem análise"
+
+
+def atualizar_pacientes_csv_real_definitivo():
+    sincronizar_resultados_exames_mock_data_flet()
+
+    pacientes_csv, _, _ = _patch_pacientes()
+    analises = _patch_ler_csv("analise_exames.csv")
+
+    por_paciente = {}
+
+    for r in analises:
+        pid = _patch_get(r, "paciente_id", "id_paciente")
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+        if pid:
+            por_paciente.setdefault(pid, []).append(r)
+
+    pacientes = []
+
+    for p in pacientes_csv:
+        pid = _patch_get(p, "paciente_id", "id")
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+
+        exames = por_paciente.get(pid, [])
+        datas = [_patch_data_exame(e) for e in exames if _patch_data_exame(e)]
+        ultimo = max(datas) if datas else ""
+
+        item = dict(p)
+        item.update({
+            "id": pid,
+            "paciente_id": pid,
+            "nome": _patch_get(p, "nome", "paciente_nome", "paciente"),
+            "idade": _patch_get(p, "idade"),
+            "sexo": _patch_get(p, "sexo"),
+            "telefone": _patch_get(p, "telefone"),
+            "email": _patch_get(p, "email"),
+            "exames": len(exames),
+            "ultimo_exame": ultimo,
+            "status": _patch_status_paciente(exames),
+        })
+
+        pacientes.append(item)
+
+    globals()["PACIENTES_MOCK"] = pacientes
+
+    if pacientes:
+        ids = [str(p.get("id", "")) for p in pacientes]
+        atual = str(globals().get("PACIENTE_SELECIONADO_ID", "") or "")
+        if atual not in ids:
+            globals()["PACIENTE_SELECIONADO_ID"] = str(pacientes[0]["id"])
+
+    print(f"[PATCH DATA_FLET] Pacientes carregados na UI: {len(pacientes)}")
+    print("[PATCH DATA_FLET] Exames por paciente:", [(p.get("nome"), p.get("exames")) for p in pacientes])
+
+    return pacientes
+
+
+def _patch_pertence(row, pid, nome_norm):
+    row_pid = _patch_get(row, "paciente_id", "id_paciente", "id")
+
+    if row_pid.isdigit() and len(row_pid) < 4:
+        row_pid = row_pid.zfill(4)
+
+    if pid and row_pid and row_pid == pid:
+        return True
+
+    row_nome = _patch_get(row, "paciente_nome", "nome_paciente", "paciente", "nome")
+    if nome_norm and row_nome and _patch_norm(row_nome) == nome_norm:
+        return True
+
+    return False
+
+
+def excluir_paciente_e_vinculos(paciente):
+    pid = _patch_get(paciente, "paciente_id", "id")
+    if pid.isdigit() and len(pid) < 4:
+        pid = pid.zfill(4)
+
+    nome = _patch_get(paciente, "nome", "paciente_nome", "paciente")
+    nome_norm = _patch_norm(nome)
+
+    if not pid and not nome_norm:
+        print("[PATCH DATA_FLET] Exclusão cancelada: paciente sem identificação.")
+        return False
+
+    cardapios = _patch_ler_csv("cardapios.csv")
+    cardapio_ids = {
+        _patch_get(c, "cardapio_id", "id")
+        for c in cardapios
+        if _patch_pertence(c, pid, nome_norm)
+    }
+    cardapio_ids = {c for c in cardapio_ids if c}
+
+    arquivos = [
+        "pacientes.csv",
+        "exames.csv",
+        "analise_exames.csv",
+        "anamnese.csv",
+        "recordatorio_habitual.csv",
+        "recordatorio.csv",
+        "antropometria.csv",
+        "cardapios.csv",
+        "cardapio_itens.csv",
+        "evolucao_conduta.csv",
+        "historico_edicoes.csv",
+        "alimentos_recordatorio_personalizados.csv",
+    ]
+
+    total = 0
+
+    for nome_csv in arquivos:
+        caminho = _patch_data_dir() / nome_csv
+        if not caminho.exists():
+            continue
+
+        rows = _patch_ler_csv(nome_csv)
+        campos = _patch_campos_csv(nome_csv)
+        novas = []
+        removidos = 0
+
+        for r in rows:
+            remover = _patch_pertence(r, pid, nome_norm)
+
+            if nome_csv == "cardapio_itens.csv":
+                cid = _patch_get(r, "cardapio_id")
+                if cid and cid in cardapio_ids:
+                    remover = True
+
+            if remover:
+                removidos += 1
+            else:
+                novas.append(r)
+
+        if removidos:
+            _patch_salvar_csv(nome_csv, novas, campos)
+            total += removidos
+            print(f"[PATCH DATA_FLET] {nome_csv}: {removidos} removido(s).")
+
+    if "RESULTADOS_EXAMES_MOCK" in globals():
+        globals()["RESULTADOS_EXAMES_MOCK"] = [
+            r for r in globals().get("RESULTADOS_EXAMES_MOCK", [])
+            if not _patch_pertence(r, pid, nome_norm)
+        ]
+
+    # Recria o dicionário de exames cadastrados a partir do CSV após a exclusão.
+    globals()["EXAMES_CADASTRADOS_MOCK"] = {}
+
+    atualizar_pacientes_csv_real_definitivo()
+
+    print(f"[PATCH DATA_FLET] Exclusão concluída para {nome or pid}. Total removido: {total}")
+    return True
+
+# ===== FIM PATCH SEGURO DATA_FLET: EXAMES ANALISE EXCLUSAO =====
+
+
+# ===== PATCH AUTO-PERSISTENCIA EXAMES CSV =====
+
+def _patch_raw_get(row, *chaves):
+    if not isinstance(row, dict):
+        return ""
+
+    chaves_limpas = [_patch_limpar_chave(c) for c in chaves]
+
+    for k, v in row.items():
+        if _patch_limpar_chave(k) in chaves_limpas:
+            if v is not None and str(v).strip() != "":
+                return v
+
+    return ""
+
+
+def _patch_pid(row):
+    pacientes, por_id, por_nome = _patch_pacientes()
+
+    candidatos_id = []
+    candidatos_nome = []
+
+    if isinstance(row, dict):
+        for campo in ["paciente_id", "id_paciente", "id"]:
+            v = _patch_raw_get(row, campo)
+            if v:
+                candidatos_id.append(str(v).strip())
+
+        for campo in ["paciente_nome", "nome_paciente", "paciente", "nome"]:
+            v = _patch_raw_get(row, campo)
+            if isinstance(v, dict):
+                candidatos_id.append(str(v.get("id") or v.get("paciente_id") or "").strip())
+                candidatos_nome.append(str(v.get("nome") or v.get("paciente") or "").strip())
+            elif v:
+                candidatos_nome.append(str(v).strip())
+
+    selecionado = str(globals().get("PACIENTE_SELECIONADO_ID", "") or "").strip()
+    if selecionado:
+        candidatos_id.append(selecionado)
+
+    for pid in candidatos_id:
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+
+        if pid in por_id:
+            return pid
+
+    nomes_tratados = []
+
+    for nome in candidatos_nome:
+        nome = str(nome or "").strip()
+        if not nome:
+            continue
+
+        nomes_tratados.append(nome)
+
+        # Ex.: "Marizete Matos - 45 anos" -> "Marizete Matos"
+        nome_sem_idade = _patch_re.sub(r"\s*-\s*\d+\s*anos?.*$", "", nome, flags=_patch_re.I).strip()
+        if nome_sem_idade and nome_sem_idade != nome:
+            nomes_tratados.append(nome_sem_idade)
+
+    for nome in nomes_tratados:
+        n = _patch_norm(nome)
+
+        if n in por_nome:
+            p = por_nome[n]
+            pid = _patch_get(p, "paciente_id", "id")
+            return pid.zfill(4) if pid.isdigit() and len(pid) < 4 else pid
+
+        for nome_ref, p in por_nome.items():
+            if n and (n.startswith(nome_ref) or nome_ref.startswith(n)):
+                pid = _patch_get(p, "paciente_id", "id")
+                return pid.zfill(4) if pid.isdigit() and len(pid) < 4 else pid
+
+    return ""
+
+
+def _patch_nome_exame(row):
+    if isinstance(row, dict):
+        for campo in ["nome_exame", "nome_padronizado", "exame", "exame_nome", "tipo_exame", "nome", "analito"]:
+            v = _patch_raw_get(row, campo)
+
+            if isinstance(v, dict):
+                for sub in ["nome_exame", "nome", "descricao", "exame", "id"]:
+                    sv = v.get(sub)
+                    if sv:
+                        texto = str(sv).strip()
+                        ref = _patch_ref(texto)
+                        return _patch_get(ref, "nome_exame", "nome") or texto
+
+            elif isinstance(v, (list, tuple)) and v:
+                texto = str(v[0]).strip()
+                ref = _patch_ref(texto)
+                return _patch_get(ref, "nome_exame", "nome") or texto
+
+            elif v:
+                texto = str(v).strip()
+                ref = _patch_ref(texto)
+                return _patch_get(ref, "nome_exame", "nome") or texto
+
+        for campo in ["exame_id", "id_exame", "id"]:
+            v = _patch_raw_get(row, campo)
+            if v:
+                texto = str(v).strip()
+                ref = _patch_ref(texto)
+                return _patch_get(ref, "nome_exame", "nome") or texto
+
+    return ""
+
+
+def _patch_resultado_valor(row):
+    return (
+        _patch_get(row, "resultado")
+        or _patch_get(row, "valor")
+        or _patch_get(row, "valor_resultado")
+        or _patch_get(row, "resultado_exame")
+    )
+
+
+def _patch_persistir_resultado_item(item):
+    if not isinstance(item, dict):
+        return False
+
+    pid = _patch_pid(item)
+    nome_exame = _patch_nome_exame(item)
+    resultado = _patch_resultado_valor(item)
+    data_exame = _patch_data_exame(item)
+    unidade = _patch_get(item, "unidade")
+
+    if not pid or not nome_exame or not resultado:
+        print(
+            "[PATCH DATA_FLET] Ignorando exame sem dados mínimos:",
+            {
+                "pid": pid,
+                "nome_exame": nome_exame,
+                "resultado": resultado,
+                "item": item,
+            },
+        )
+        return False
+
+    refs = _patch_refs()
+    ref = _patch_ref(nome_exame, refs)
+
+    if not unidade:
+        unidade = _patch_get(ref, "unidade")
+
+    exames = _patch_ler_csv("exames.csv")
+    analises = _patch_ler_csv("analise_exames.csv")
+
+    chave = (
+        pid,
+        _patch_norm(data_exame),
+        _patch_norm(nome_exame),
+        _patch_norm(resultado),
+        _patch_norm(unidade),
+    )
+
+    chaves_exames = {_patch_chave(r) for r in exames}
+    chaves_analises = {_patch_chave(r) for r in analises}
+
+    mudou = False
+
+    if chave not in chaves_exames:
+        exames.append({
+            "exame_id": _patch_proximo_id(exames, "exame_id", 4),
+            "paciente_id": pid,
+            "data_exame": data_exame,
+            "nome_exame": nome_exame,
+            "resultado": resultado,
+            "unidade": unidade,
+            "observacoes": _patch_get(item, "observacoes", "obs") or "Lançado pela interface NutriSoft",
+        })
+
+        _patch_salvar_csv(
+            "exames.csv",
+            exames,
+            [
+                "exame_id",
+                "paciente_id",
+                "data_exame",
+                "nome_exame",
+                "resultado",
+                "unidade",
+                "observacoes",
+            ],
+        )
+        mudou = True
+
+    if chave not in chaves_analises:
+        analise = _patch_analisar(nome_exame, resultado, unidade, refs)
+
+        analises.append({
+            "analise_id": _patch_proximo_id(analises, "analise_id"),
+            "paciente_id": pid,
+            "data_exame": data_exame,
+            "nome_exame": nome_exame,
+            "nome_padronizado": analise["nome_padronizado"],
+            "resultado": resultado,
+            "unidade": unidade,
+            "valor_min": analise["valor_min"],
+            "valor_max": analise["valor_max"],
+            "status": analise["status"],
+            "mensagem": analise["mensagem"],
+            "fonte_referencia": analise["fonte_referencia"],
+        })
+
+        _patch_salvar_csv(
+            "analise_exames.csv",
+            analises,
+            [
+                "analise_id",
+                "paciente_id",
+                "data_exame",
+                "nome_exame",
+                "nome_padronizado",
+                "resultado",
+                "unidade",
+                "valor_min",
+                "valor_max",
+                "status",
+                "mensagem",
+                "fonte_referencia",
+            ],
+        )
+        mudou = True
+
+    if mudou:
+        print(f"[PATCH DATA_FLET] Exame persistido em CSV: paciente={pid} | exame={nome_exame} | resultado={resultado} {unidade}")
+
+    return mudou
+
+
+class _PatchResultadosPersistentes(list):
+    def append(self, item):
+        super().append(item)
+
+        try:
+            persistiu = _patch_persistir_resultado_item(item)
+
+            if persistiu:
+                try:
+                    sincronizar_resultados_exames_mock_data_flet()
+                    print("[PATCH DATA_FLET] Interface/memória atualizada após salvar exame.")
+                except Exception as exc:
+                    print(f"[PATCH DATA_FLET] Exame salvo, mas falhou atualização da memória: {exc}")
+
+        except Exception as exc:
+            print(f"[PATCH DATA_FLET] Falha ao persistir exame no append: {exc}")
+
+
+def sincronizar_resultados_exames_mock_data_flet():
+    _patch_migrar_mock_para_csv()
+
+    analises = _patch_ler_csv("analise_exames.csv")
+    refs = _patch_refs()
+    resultados = []
+
+    for r in analises:
+        pid = _patch_get(r, "paciente_id", "id_paciente")
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+
+        nome_exame = _patch_nome_exame(r)
+        unidade = _patch_get(r, "unidade")
+        resultado = _patch_get(r, "resultado", "valor")
+        data_exame = _patch_data_exame(r)
+
+        ref = _patch_ref(nome_exame, refs)
+        referencia = _patch_referencia_texto(ref, unidade)
+
+        status = _patch_get(r, "status")
+        if not status:
+            status = _patch_analisar(nome_exame, resultado, unidade, refs)["status"]
+
+        item = dict(r)
+        item.update({
+            "paciente_id": pid,
+            "id_paciente": pid,
+            "paciente": _patch_nome_paciente(pid),
+            "paciente_nome": _patch_nome_paciente(pid),
+            "data": data_exame,
+            "data_exame": data_exame,
+            "exame": nome_exame,
+            "nome_exame": nome_exame,
+            "nome_padronizado": _patch_get(r, "nome_padronizado") or nome_exame,
+            "resultado": resultado,
+            "unidade": unidade,
+            "referencia": referencia,
+            "referencia_texto": referencia,
+            "status": status,
+            "mensagem": _patch_get(r, "mensagem"),
+            "fonte_referencia": _patch_get(r, "fonte_referencia"),
+        })
+
+        resultados.append(item)
+
+    globals()["RESULTADOS_EXAMES_MOCK"] = _PatchResultadosPersistentes(resultados)
+
+    cadastrados = {}
+
+    for item in resultados:
+        pid = _patch_get(item, "paciente_id", "id_paciente")
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+
+        data = _patch_data_exame(item)
+        nome_exame = _patch_nome_exame(item)
+        ref = _patch_ref(nome_exame, refs)
+        ref_id = _patch_get(ref, "id")
+
+        if not pid or not data or not nome_exame:
+            continue
+
+        valores = [nome_exame]
+        if ref_id:
+            valores.append(ref_id)
+
+        for chave in [(pid, data), (str(pid), data)]:
+            cadastrados.setdefault(chave, [])
+            for valor in valores:
+                if valor and valor not in cadastrados[chave]:
+                    cadastrados[chave].append(valor)
+
+    globals()["EXAMES_CADASTRADOS_MOCK"] = cadastrados
+
+    print(f"[PATCH DATA_FLET] Resultados sincronizados: {len(resultados)}")
+    print(f"[PATCH DATA_FLET] Datas com exames cadastrados: {len(cadastrados)}")
+    return resultados
+
+# ===== FIM PATCH AUTO-PERSISTENCIA EXAMES CSV =====
+
+
+# ===== PATCH TELA CADASTRO EXAMES: DATA E JA CADASTRADOS =====
+
+def _patch_data_iso_cadastro(valor):
+    texto = str(valor or "").strip()
+
+    if not texto:
+        return ""
+
+    # dd/mm/aaaa -> aaaa-mm-dd
+    m = _patch_re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", texto)
+    if m:
+        d, mth, y = m.groups()
+        return f"{y}-{int(mth):02d}-{int(d):02d}"
+
+    # aaaa-mm-dd
+    m = _patch_re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", texto)
+    if m:
+        y, mth, d = m.groups()
+        return f"{y}-{int(mth):02d}-{int(d):02d}"
+
+    return texto
+
+
+def _patch_data_br_cadastro(valor):
+    iso = _patch_data_iso_cadastro(valor)
+
+    m = _patch_re.match(r"^(\d{4})-(\d{2})-(\d{2})$", iso)
+    if m:
+        y, mth, d = m.groups()
+        return f"{d}/{mth}/{y}"
+
+    return str(valor or "").strip()
+
+
+def chave_exames_paciente_data(paciente_id, data_exame):
+    pid = str(paciente_id or "").strip()
+
+    if pid.isdigit() and len(pid) < 4:
+        pid = pid.zfill(4)
+
+    return (pid, _patch_data_iso_cadastro(data_exame))
+
+
+def _patch_token_exame_cadastrado(nome_exame):
+    ref = _patch_ref(nome_exame)
+    ref_id = _patch_get(ref, "id")
+
+    if ref_id:
+        return ref_id
+
+    return str(nome_exame or "").strip()
+
+
+def _patch_reconstruir_exames_cadastrados_por_data():
+    global EXAMES_CADASTRADOS_MOCK
+
+    cadastrados = {}
+
+    for r in _patch_ler_csv("analise_exames.csv"):
+        pid = _patch_get(r, "paciente_id", "id_paciente")
+
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+
+        data_raw = _patch_data_exame(r)
+        data_iso = _patch_data_iso_cadastro(data_raw)
+        data_br = _patch_data_br_cadastro(data_raw)
+
+        nome_exame = _patch_nome_exame(r)
+
+        if not pid or not data_iso or not nome_exame:
+            continue
+
+        token = _patch_token_exame_cadastrado(nome_exame)
+
+        if not token:
+            continue
+
+        # Mantém compatibilidade com telas que usam ISO e telas que usam DD/MM/AAAA.
+        for data_key in {data_raw, data_iso, data_br}:
+            if not data_key:
+                continue
+
+            chave = (pid, _patch_data_iso_cadastro(data_key))
+            cadastrados.setdefault(chave, [])
+
+            if token not in cadastrados[chave]:
+                cadastrados[chave].append(token)
+
+    EXAMES_CADASTRADOS_MOCK = cadastrados
+    globals()["EXAMES_CADASTRADOS_MOCK"] = EXAMES_CADASTRADOS_MOCK
+
+    print(f"[PATCH CADASTRO EXAMES] Índice paciente+data reconstruído: {len(cadastrados)} data(s).")
+    return cadastrados
+
+
+try:
+    _patch_sync_original_cadastro_exames
+except NameError:
+    _patch_sync_original_cadastro_exames = sincronizar_resultados_exames_mock_data_flet
+
+
+def sincronizar_resultados_exames_mock_data_flet():
+    resultados = _patch_sync_original_cadastro_exames()
+    _patch_reconstruir_exames_cadastrados_por_data()
+    return resultados
+
+
+try:
+    _patch_exames_ja_original_cadastro
+except NameError:
+    _patch_exames_ja_original_cadastro = exames_ja_cadastrados_por_data
+
+
+def exames_ja_cadastrados_por_data(paciente_id, data_exame):
+    _patch_reconstruir_exames_cadastrados_por_data()
+    return _patch_exames_ja_original_cadastro(paciente_id, data_exame)
+
+
+try:
+    _patch_exames_disponiveis_original_cadastro
+except NameError:
+    _patch_exames_disponiveis_original_cadastro = exames_disponiveis_por_data
+
+
+def exames_disponiveis_por_data(paciente_id, data_exame):
+    _patch_reconstruir_exames_cadastrados_por_data()
+    return _patch_exames_disponiveis_original_cadastro(paciente_id, data_exame)
+
+# ===== FIM PATCH TELA CADASTRO EXAMES: DATA E JA CADASTRADOS =====
+
+
+# ===== PATCH CATALOGO EXAMES: DEDUP E GRUPOS =====
+
+_EXAME_ALIASES_PADRAO = {
+    "glucose": "Glicose",
+    "glicemia": "Glicose",
+    "glicose jejum": "Glicose",
+    "glicose em jejum": "Glicose",
+    "hemoglobina glicada hba1c": "Hemoglobina glicada",
+    "hba1c": "Hemoglobina glicada",
+    "colesterol": "Colesterol Total",
+    "colesterol total": "Colesterol Total",
+    "colesterol hdl": "HDL",
+    "hdl colesterol": "HDL",
+    "colesterol ldl": "LDL",
+    "ldl colesterol": "LDL",
+    "vldl colesterol": "VLDL",
+    "colesterol vldl": "VLDL",
+    "triglicerides": "Triglicerídeos",
+    "triglicerideos": "Triglicerídeos",
+    "tgo": "TGO / AST",
+    "ast": "TGO / AST",
+    "transaminase oxalacetica": "TGO / AST",
+    "tgp": "TGP / ALT",
+    "alt": "TGP / ALT",
+    "transaminase piruvica": "TGP / ALT",
+    "gama gt": "Gama GT",
+    "ggt": "Gama GT",
+    "gamma gt": "Gama GT",
+    "fosfatase alcalina": "Fosfatase Alcalina",
+    "creatinina sangue": "Creatinina",
+    "creatinina serica": "Creatinina",
+    "ureia sangue": "Ureia",
+    "acido urico": "Ácido Úrico",
+    "sodio": "Sódio",
+    "potassio": "Potássio",
+    "calcio": "Cálcio",
+    "magnesio": "Magnésio",
+    "ferritina serica": "Ferritina",
+    "ferro serico": "Ferro",
+    "vitamina d": "Vitamina D",
+    "25 oh vitamina d": "Vitamina D",
+    "vitamina b12": "Vitamina B12",
+    "b12": "Vitamina B12",
+    "tsh": "TSH",
+    "t4 livre": "T4 Livre",
+    "t3 livre": "T3 Livre",
+    "hemograma": "Hemograma",
+    "hemacias": "Hemácias",
+    "leucocitos": "Leucócitos",
+    "plaquetas": "Plaquetas",
+    "insulina jejum": "Insulina",
+    "insulina em jejum": "Insulina",
+    "pcr": "Proteína C Reativa",
+    "proteina c reativa": "Proteína C Reativa",
+}
+
+def _patch_nome_canonico_exame(nome):
+    texto = str(nome or "").strip()
+    n = _patch_norm(texto)
+
+    if not n:
+        return texto
+
+    # Remove ruídos comuns vindos de laudos/listas
+    n = n.replace("dosagem de ", "")
+    n = n.replace("dosagem da ", "")
+    n = n.replace("dosagem do ", "")
+    n = n.replace("serico", "")
+    n = n.replace("serica", "")
+    n = " ".join(n.split())
+
+    if n in _EXAME_ALIASES_PADRAO:
+        return _EXAME_ALIASES_PADRAO[n]
+
+    return texto
+
+
+def _patch_grupo_exame_correto(nome, grupo_atual=""):
+    n = _patch_norm(nome)
+
+    regras = [
+        ("Metabolismo glicídico", [
+            "glicose", "glicemia", "hemoglobina glicada", "hba1c",
+            "glicemia media", "insulina", "homa", "peptideo c"
+        ]),
+        ("Perfil Lipídico", [
+            "colesterol", "hdl", "ldl", "vldl", "triglicer",
+            "apolipoproteina", "lipoproteina"
+        ]),
+        ("Função Renal", [
+            "creatinina", "ureia", "acido urico", "urina", "microalbuminuria",
+            "clearance", "taxa de filtracao", "albumina creatinina"
+        ]),
+        ("Função Hepática", [
+            "tgo", "ast", "tgp", "alt", "gama gt", "ggt",
+            "fosfatase alcalina", "bilirrubina", "albumina", "proteinas totais"
+        ]),
+        ("Hemograma", [
+            "hemograma", "hemacia", "hemoglobina", "hematocrito",
+            "leucocito", "neutrofilo", "linfocito", "monocito",
+            "eosinofilo", "basofilo", "plaqueta", "vcm", "hcm", "chcm", "rdw"
+        ]),
+        ("Vitaminas e Minerais", [
+            "vitamina", "25 oh", "b12", "folato", "ferro", "ferritina",
+            "transferrina", "calcio", "magnesio", "zinco", "selenio"
+        ]),
+        ("Eletrólitos", [
+            "sodio", "potassio", "cloro", "fosforo", "bicarbonato"
+        ]),
+        ("Tireoide", [
+            "tsh", "t4", "t3", "tireoglobulina", "anti tpo", "anti tg",
+            "trab", "tireoide"
+        ]),
+        ("Inflamação e Imunologia", [
+            "pcr", "proteina c reativa", "vhs", "fator reumatoide",
+            "ana", "fan", "imunoglobulina"
+        ]),
+        ("Coagulação", [
+            "tp", "ttpa", "inr", "protrombina", "fibrinogenio", "d dimero"
+        ]),
+        ("Hormônios", [
+            "testosterona", "estradiol", "progesterona", "prolactina",
+            "cortisol", "lh", "fsh", "dhea", "shbg"
+        ]),
+    ]
+
+    for grupo, termos in regras:
+        if any(t in n for t in termos):
+            return grupo
+
+    return str(grupo_atual or "Outros").strip() or "Outros"
+
+
+def _patch_id_canonico_exame(nome):
+    nome_can = _patch_nome_canonico_exame(nome)
+    n = _patch_norm(nome_can)
+    n = n.replace("%", "percentual")
+    n = _patch_re.sub(r"[^a-z0-9]+", "_", n).strip("_")
+    return n or _patch_re.sub(r"[^a-z0-9]+", "_", _patch_norm(nome)).strip("_")
+
+
+def _patch_normalizar_item_exame(item):
+    if not isinstance(item, dict):
+        return item
+
+    novo = dict(item)
+
+    nome_original = (
+        novo.get("nome_exame")
+        or novo.get("nome")
+        or novo.get("exame")
+        or novo.get("descricao")
+        or novo.get("id")
+        or ""
+    )
+
+    nome_can = _patch_nome_canonico_exame(nome_original)
+    grupo = _patch_grupo_exame_correto(nome_can, novo.get("grupo"))
+
+    id_can = _patch_id_canonico_exame(nome_can)
+
+    novo["id"] = novo.get("id") or id_can
+    novo["id_canonico"] = id_can
+    novo["nome"] = nome_can
+    novo["nome_exame"] = nome_can
+    novo["grupo"] = grupo
+
+    return novo
+
+
+def _patch_dedup_lista_exames(lista):
+    vistos = {}
+    ordem = []
+
+    for item in list(lista or []):
+        if not isinstance(item, dict):
+            continue
+
+        item = _patch_normalizar_item_exame(item)
+        chave = item.get("id_canonico") or _patch_id_canonico_exame(
+            item.get("nome_exame") or item.get("nome") or item.get("id")
+        )
+
+        if not chave:
+            continue
+
+        if chave not in vistos:
+            vistos[chave] = item
+            ordem.append(chave)
+        else:
+            atual = vistos[chave]
+
+            # Mantém o item mais completo, preservando referência/fonte/unidade.
+            for campo in [
+                "referencia", "referencia_texto", "valor_min", "valor_max",
+                "unidade", "fonte", "fonte_referencia", "status", "observacoes"
+            ]:
+                if not atual.get(campo) and item.get(campo):
+                    atual[campo] = item.get(campo)
+
+            if atual.get("grupo") in ["Outros", "", None] and item.get("grupo"):
+                atual["grupo"] = item.get("grupo")
+
+            vistos[chave] = atual
+
+    return [vistos[k] for k in ordem]
+
+
+def _patch_ordenar_exames_catalogo(lista):
+    ordem_grupos = {
+        "Metabolismo glicídico": 1,
+        "Perfil Lipídico": 2,
+        "Função Renal": 3,
+        "Função Hepática": 4,
+        "Hemograma": 5,
+        "Vitaminas e Minerais": 6,
+        "Eletrólitos": 7,
+        "Tireoide": 8,
+        "Inflamação e Imunologia": 9,
+        "Coagulação": 10,
+        "Hormônios": 11,
+        "Outros": 99,
+    }
+
+    return sorted(
+        lista or [],
+        key=lambda x: (
+            ordem_grupos.get(str(x.get("grupo") or "Outros"), 98),
+            _patch_norm(x.get("nome_exame") or x.get("nome") or "")
+        )
+    )
+
+
+try:
+    _patch_criar_opcoes_grupos_original
+except NameError:
+    _patch_criar_opcoes_grupos_original = criar_opcoes_grupos_exames
+
+
+def criar_opcoes_grupos_exames(lista_exames):
+    lista = _patch_ordenar_exames_catalogo(_patch_dedup_lista_exames(lista_exames))
+    return _patch_criar_opcoes_grupos_original(lista)
+
+
+try:
+    _patch_criar_opcoes_exames_original
+except NameError:
+    _patch_criar_opcoes_exames_original = criar_opcoes_exames_por_grupo
+
+
+def criar_opcoes_exames_por_grupo(lista_exames, grupo=None, exames_ja_cadastrados=None):
+    lista = _patch_ordenar_exames_catalogo(_patch_dedup_lista_exames(lista_exames))
+
+    # Garante que bloqueio funcione tanto por id antigo quanto por id/nome canônico.
+    ja = set(exames_ja_cadastrados or [])
+    ja_expandido = set(ja)
+
+    for v in list(ja):
+        ja_expandido.add(_patch_id_canonico_exame(v))
+        ja_expandido.add(_patch_nome_canonico_exame(v))
+
+    filtrada = []
+    for item in lista:
+        item = _patch_normalizar_item_exame(item)
+        tokens = {
+            str(item.get("id") or ""),
+            str(item.get("id_canonico") or ""),
+            str(item.get("nome") or ""),
+            str(item.get("nome_exame") or ""),
+            _patch_id_canonico_exame(item.get("nome_exame") or item.get("nome")),
+        }
+
+        if tokens & ja_expandido:
+            continue
+
+        filtrada.append(item)
+
+    return _patch_criar_opcoes_exames_original(filtrada, grupo, ja_expandido)
+
+
+try:
+    _patch_exames_disponiveis_grupo_original
+except NameError:
+    _patch_exames_disponiveis_grupo_original = exames_disponiveis_por_data
+
+
+def exames_disponiveis_por_data(paciente_id, data_exame):
+    lista = _patch_exames_disponiveis_grupo_original(paciente_id, data_exame)
+    return _patch_ordenar_exames_catalogo(_patch_dedup_lista_exames(lista))
+
+
+try:
+    _patch_garantir_nome_original
+except NameError:
+    _patch_garantir_nome_original = garantir_nome_exame_item
+
+
+def garantir_nome_exame_item(item):
+    item = _patch_garantir_nome_original(item)
+    return _patch_normalizar_item_exame(item)
+
+
+try:
+    _patch_nome_exibicao_original
+except NameError:
+    _patch_nome_exibicao_original = nome_exame_para_exibicao
+
+
+def nome_exame_para_exibicao(item):
+    if isinstance(item, dict):
+        item = _patch_normalizar_item_exame(item)
+        return item.get("nome_exame") or item.get("nome") or item.get("id") or "-"
+    return _patch_nome_exibicao_original(item)
+
+# ===== FIM PATCH CATALOGO EXAMES: DEDUP E GRUPOS =====
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ===== PATCH UX TABELAS NUTRICAO: LINHAS ALTAS E TEXTO WRAP =====
+
+# Corrige tabelas com textos longos cortados verticalmente.
+# A tela Nutrição usa DataTable em várias versões (_nutri, _ng, _nr),
+# então o ajuste é aplicado de forma global e segura.
+
+try:
+    _patch_ft_datatable_original
+except NameError:
+    _patch_ft_datatable_original = ft.DataTable
+
+
+def _patch_datatable_com_linhas_altas(*args, **kwargs):
+    # Aplica linha alta SOMENTE em tabelas largas, como "Análise dos exames".
+    # Tabelas compactas, como "Exames alterados", devem manter altura normal.
+    colunas = kwargs.get("columns")
+
+    if colunas is None and args:
+        try:
+            # Algumas versões recebem columns como primeiro argumento nomeado/posicional.
+            possivel = args[0]
+            if isinstance(possivel, list):
+                colunas = possivel
+        except Exception:
+            colunas = None
+
+    qtd_colunas = len(colunas or [])
+
+    tabela_longa_nutricional = qtd_colunas >= 5
+
+    if not tabela_longa_nutricional:
+        # Não altera tabelas simples: Data, Exame, Resultado, Status etc.
+        return _patch_ft_datatable_original(*args, **kwargs)
+
+    # Remove altura fixa antiga, quando existir.
+    kwargs.pop("data_row_height", None)
+
+    # Altura confortável para textos longos de interpretação/conduta.
+    kwargs.setdefault("data_row_min_height", 84)
+    kwargs.setdefault("data_row_max_height", 180)
+    kwargs.setdefault("heading_row_height", 58)
+    kwargs.setdefault("column_spacing", 22)
+    kwargs.setdefault("horizontal_margin", 12)
+
+    try:
+        return _patch_ft_datatable_original(*args, **kwargs)
+    except TypeError:
+        # Fallback para versões antigas do Flet.
+        kwargs.pop("data_row_min_height", None)
+        kwargs.pop("data_row_max_height", None)
+        kwargs.setdefault("data_row_height", 120)
+        return _patch_ft_datatable_original(*args, **kwargs)
+
+
+ft.DataTable = _patch_datatable_com_linhas_altas
+
+
+def _patch_texto_tabela_wrap(texto, largura=160, negrito=False, tamanho=11):
+    return ft.Container(
+        width=largura,
+        padding=8,
+        content=ft.Text(
+            str(texto or "-"),
+            size=tamanho,
+            weight=ft.FontWeight.BOLD if negrito else ft.FontWeight.NORMAL,
+            color="#111827" if negrito else "#374151",
+            no_wrap=False,
+            max_lines=None,
+            overflow=ft.TextOverflow.VISIBLE,
+        ),
+    )
+
+
+# Sobrescreve helpers usados nas versões da tela de Nutrição.
+# Usa *args/**kwargs para não quebrar chamadas antigas com parâmetros diferentes.
+
+def _patch_cell_generico(*args, **kwargs):
+    texto = args[0] if len(args) >= 1 else kwargs.get("texto", "")
+    largura = args[1] if len(args) >= 2 else kwargs.get("largura", kwargs.get("width", 160))
+    negrito = kwargs.get("negrito", kwargs.get("bold", False))
+    tamanho = kwargs.get("tamanho", kwargs.get("size", 11))
+    return _patch_texto_tabela_wrap(texto, largura, negrito, tamanho)
+
+
+def _nutri_cell_tabela(*args, **kwargs):
+    return _patch_cell_generico(*args, **kwargs)
+
+
+def _nutri_texto_tabela(*args, **kwargs):
+    return _patch_cell_generico(*args, **kwargs)
+
+
+def _ng_cell_tabela(*args, **kwargs):
+    return _patch_cell_generico(*args, **kwargs)
+
+
+def _ng_texto_tabela(*args, **kwargs):
+    return _patch_cell_generico(*args, **kwargs)
+
+
+def _nr_cell_tabela(*args, **kwargs):
+    return _patch_cell_generico(*args, **kwargs)
+
+
+def _nr_texto_tabela(*args, **kwargs):
+    return _patch_cell_generico(*args, **kwargs)
+
+
+def _ns_cell_tabela(*args, **kwargs):
+    return _patch_cell_generico(*args, **kwargs)
+
+
+def _ns_texto_tabela(*args, **kwargs):
+    return _patch_cell_generico(*args, **kwargs)
+
+# ===== FIM PATCH UX TABELAS NUTRICAO: LINHAS ALTAS E TEXTO WRAP =====
+
+
+# ===== PATCH ANALISE INTELIGENTE: CONDUTAS ESPECIFICAS =====
+
+def _ia_norm(valor):
+    try:
+        return _patch_norm(valor)
+    except Exception:
+        import unicodedata, re
+        texto = str(valor or "").strip().lower()
+        texto = unicodedata.normalize("NFKD", texto)
+        texto = "".join(c for c in texto if not unicodedata.combining(c))
+        texto = re.sub(r"[^a-z0-9%/., ]+", " ", texto)
+        return " ".join(texto.split())
+
+
+def _ia_exame_por_texto(texto):
+    n = _ia_norm(texto)
+
+    exames = [
+        ("Hemoglobina glicada", ["hemoglobina glicada", "hba1c"]),
+        ("Glicose", ["glicose", "glicemia"]),
+        ("Insulina", ["insulina"]),
+        ("Triglicerídeos", ["triglicerideos", "triglicerides"]),
+        ("Ferritina", ["ferritina"]),
+        ("Vitamina D", ["vitamina d", "25 oh"]),
+        ("Vitamina B12", ["vitamina b12", "b12"]),
+        ("Colesterol Total", ["colesterol total"]),
+        ("LDL", ["ldl"]),
+        ("HDL", ["hdl"]),
+        ("VLDL", ["vldl"]),
+        ("Creatinina", ["creatinina"]),
+        ("Ureia", ["ureia"]),
+        ("Ácido Úrico", ["acido urico"]),
+        ("TGO / AST", ["tgo", "ast"]),
+        ("TGP / ALT", ["tgp", "alt"]),
+        ("Gama GT", ["gama gt", "ggt"]),
+        ("Fosfatase Alcalina", ["fosfatase alcalina"]),
+        ("Bilirrubinas", ["bilirrubina"]),
+        ("Hemoglobina", ["hemoglobina"]),
+        ("Hemácias", ["hemacias"]),
+        ("Leucócitos", ["leucocitos"]),
+        ("Plaquetas", ["plaquetas"]),
+        ("Sódio", ["sodio"]),
+        ("Potássio", ["potassio"]),
+        ("Magnésio", ["magnesio"]),
+        ("Cálcio", ["calcio"]),
+        ("TSH", ["tsh"]),
+        ("T4 Livre", ["t4 livre"]),
+        ("T3 Livre", ["t3 livre"]),
+        ("Proteína C Reativa", ["proteina c reativa", "pcr"]),
+    ]
+
+    for nome, termos in exames:
+        if any(t in n for t in termos):
+            return nome
+
+    # fallback: pega o texto antes de "acima/abaixo"
+    for sep in [" acima", " abaixo", " alterado", " fora"]:
+        if sep in n:
+            bruto = str(texto).split(sep.strip())[0].strip()
+            return bruto[:40] if bruto else "Exame"
+
+    return "Exame"
+
+
+def _ia_direcao(texto):
+    n = _ia_norm(texto)
+
+    if any(t in n for t in ["abaixo", "baixo", "reduzido", "deficiencia"]):
+        return "baixo"
+
+    if any(t in n for t in ["acima", "alto", "elevado", "aumentado"]):
+        return "alto"
+
+    return "alterado"
+
+
+def _ia_interpretacao(direcao):
+    if direcao == "alto":
+        return "Acima da referência"
+    if direcao == "baixo":
+        return "Abaixo da referência"
+    return "Fora da referência"
+
+
+def _ia_possivel_alteracao(exame, direcao):
+    e = _ia_norm(exame)
+
+    if "glicose" in e:
+        return "Hiperglicemia no exame. Avaliar controle glicêmico, resistência insulínica e contexto de jejum."
+    if "hemoglobina glicada" in e:
+        return "Média glicêmica elevada nas últimas semanas, sugerindo pior controle glicêmico crônico."
+    if "insulina" in e:
+        return "Hiperinsulinemia, frequentemente associada à resistência insulínica e maior demanda pancreática."
+    if "triglicer" in e:
+        return "Triglicerídeos elevados, associados a excesso de carboidratos refinados, álcool, resistência insulínica ou esteatose."
+    if "ferritina" in e and direcao == "alto":
+        return "Ferritina elevada. Pode refletir inflamação, sobrecarga de ferro, alteração hepática/metabólica ou suplementação."
+    if "ferritina" in e and direcao == "baixo":
+        return "Ferritina reduzida, sugerindo baixa reserva de ferro e risco de deficiência."
+    if "vitamina d" in e and direcao == "baixo":
+        return "Vitamina D abaixo do ideal, com impacto potencial em saúde óssea, imunidade e função muscular."
+    if "vitamina b12" in e and direcao == "baixo":
+        return "Vitamina B12 baixa, podendo impactar energia, função neurológica e produção de células sanguíneas."
+    if "colesterol total" in e:
+        return "Colesterol total elevado. Interpretar junto com LDL, HDL, triglicerídeos e risco cardiovascular global."
+    if e == "ldl":
+        return "LDL elevado, marcador relevante para risco cardiovascular e aterosclerótico."
+    if e == "hdl" and direcao == "baixo":
+        return "HDL baixo, geralmente associado a sedentarismo, resistência insulínica, tabagismo ou pior qualidade alimentar."
+    if "creatinina" in e or "ureia" in e:
+        return "Alteração de marcador renal. Interpretar com hidratação, massa muscular, ingestão proteica e função renal."
+    if "acido urico" in e:
+        return "Ácido úrico alterado, associado a metabolismo de purinas, resistência insulínica, álcool, frutose e risco de gota."
+    if any(t in e for t in ["tgo", "tgp", "gama gt", "fosfatase", "bilirrubina"]):
+        return "Marcador hepático alterado. Avaliar álcool, gordura hepática, medicamentos, inflamação e padrão alimentar."
+    if any(t in e for t in ["hemoglobina", "hemacias"]):
+        return "Alteração hematológica. Avaliar ferro, B12, folato, hidratação e perdas sanguíneas."
+    if "leucocitos" in e:
+        return "Alteração de leucócitos, podendo refletir resposta inflamatória, infecciosa ou imunológica."
+    if "plaquetas" in e:
+        return "Plaquetas alteradas. Interpretar com hemograma completo, inflamação e avaliação médica."
+    if any(t in e for t in ["sodio", "potassio", "magnesio", "calcio"]):
+        return "Eletrólito/mineral alterado. Avaliar hidratação, função renal, medicamentos, ingestão alimentar e perdas."
+    if any(t in e for t in ["tsh", "t4", "t3"]):
+        return "Marcador tireoidiano alterado. Avaliar metabolismo, sintomas, medicamentos e acompanhamento endocrinológico."
+    if "proteina c reativa" in e:
+        return "Marcador inflamatório elevado. Avaliar infecção, inflamação crônica, composição corporal e padrão alimentar."
+
+    return f"{exame} {('acima' if direcao == 'alto' else 'abaixo' if direcao == 'baixo' else 'fora')} da referência laboratorial."
+
+
+def _ia_conduta_nutricional(exame, direcao):
+    e = _ia_norm(exame)
+
+    if "glicose" in e:
+        return "Priorizar controle de carga glicêmica: reduzir açúcar, bebidas adoçadas, farinha branca e grandes porções de carboidrato isolado. Distribuir carboidratos ao longo do dia, associando proteína, fibras e gorduras boas nas refeições."
+    if "hemoglobina glicada" in e:
+        return "Estruturar plano alimentar para controle glicêmico contínuo: carboidratos de menor índice glicêmico, aumento de fibras, redução de ultraprocessados e ajuste de porções. Monitorar adesão e evolução em 8 a 12 semanas."
+    if "insulina" in e:
+        return "Focar em resistência insulínica: reduzir beliscos doces/refinados, evitar picos glicêmicos, aumentar proteína no café da manhã e refeições principais, incluir fibras e estimular rotina de atividade física conforme liberação clínica."
+    if "triglicer" in e:
+        return "Reduzir açúcar, sucos, refrigerantes, álcool, doces, pães/massas em excesso e ultraprocessados. Priorizar peixe, azeite, castanhas em porções controladas, legumes, verduras e carboidratos integrais conforme necessidade energética."
+    if "ferritina" in e and direcao == "alto":
+        return "Não indicar suplementação de ferro sem investigação. Reduzir álcool e ultraprocessados, avaliar excesso de carnes vermelhas/processadas e priorizar padrão anti-inflamatório com vegetais, leguminosas, fibras e gorduras de boa qualidade."
+    if "ferritina" in e and direcao == "baixo":
+        return "Aumentar fontes de ferro conforme tolerância: carnes magras, ovos, feijões e vegetais verde-escuros. Associar vitamina C nas refeições e evitar café/chá junto das principais fontes de ferro."
+    if "vitamina d" in e and direcao == "baixo":
+        return "Avaliar suplementação com profissional habilitado e exposição solar segura. Garantir ingestão adequada de gorduras boas e alimentos como ovos, peixes e laticínios fortificados quando compatíveis com o plano alimentar."
+    if "vitamina b12" in e and direcao == "baixo":
+        return "Avaliar ingestão de alimentos de origem animal e necessidade de suplementação. Investigar uso de metformina, antiácidos, restrições alimentares e sintomas neurológicos ou hematológicos."
+    if "colesterol total" in e or e == "ldl":
+        return "Adotar padrão cardioprotetor: reduzir gordura saturada, embutidos, frituras e ultraprocessados; aumentar fibras solúveis, aveia, leguminosas, frutas, vegetais, azeite e oleaginosas em porções planejadas."
+    if e == "hdl" and direcao == "baixo":
+        return "Melhorar qualidade da gordura alimentar e rotina de exercício: azeite, peixes, castanhas em porção controlada e redução de açúcar/refinados. Evitar tabagismo e sedentarismo."
+    if "creatinina" in e or "ureia" in e:
+        return "Revisar ingestão proteica, hidratação e uso de suplementos como creatina/proteína. Não restringir proteína sem avaliar função renal, massa muscular e orientação profissional."
+    if "acido urico" in e:
+        return "Reduzir álcool, especialmente cerveja, excesso de carnes/miúdos, embutidos, frutos do mar e bebidas adoçadas/frutose. Aumentar hidratação e priorizar padrão alimentar com vegetais e alimentos pouco processados."
+    if any(t in e for t in ["tgo", "tgp", "gama gt", "fosfatase", "bilirrubina"]):
+        return "Priorizar estratégia hepática: reduzir álcool, açúcar, frituras e ultraprocessados; favorecer perda de gordura corporal quando indicada, aumentar fibras, vegetais e padrão mediterrâneo."
+    if any(t in e for t in ["hemoglobina", "hemacias"]):
+        return "Avaliar ferro, B12, folato e ingestão proteica. Ajustar fontes alimentares conforme a deficiência provável e investigar perdas sanguíneas ou baixa absorção quando persistente."
+    if "leucocitos" in e:
+        return "Não há conduta nutricional isolada específica. Reforçar padrão anti-inflamatório, hidratação, sono adequado e investigar sinais infecciosos/inflamatórios com avaliação clínica."
+    if "plaquetas" in e:
+        return "Conduta nutricional deve ser cautelosa. Evitar suplementação sem indicação e correlacionar com hemograma, inflamação, medicamentos e avaliação médica."
+    if any(t in e for t in ["sodio", "potassio", "magnesio", "calcio"]):
+        return "Revisar hidratação, consumo de ultraprocessados, reposição de eletrólitos, medicamentos e perdas por suor, vômitos ou diarreia. Ajustar alimentos fonte conforme o mineral alterado."
+    if any(t in e for t in ["tsh", "t4", "t3"]):
+        return "Ajustar suporte nutricional da tireoide: proteína adequada, selênio, zinco, ferro e iodo conforme necessidade. Evitar suplementação isolada sem confirmar deficiência."
+    if "proteina c reativa" in e:
+        return "Focar em padrão anti-inflamatório: vegetais variados, frutas, leguminosas, peixes, azeite, fibras e redução de ultraprocessados, açúcar, álcool e excesso calórico."
+
+    return "Individualizar conduta conforme anamnese, recordatório, medicamentos, sintomas e objetivo nutricional. Reavaliar o marcador após intervenção alimentar planejada."
+
+
+def _ia_complementares(exame, direcao):
+    e = _ia_norm(exame)
+
+    if "glicose" in e:
+        return "Hemoglobina glicada, insulina, HOMA-IR, triglicerídeos, HDL e circunferência abdominal."
+    if "hemoglobina glicada" in e:
+        return "Glicemia de jejum, insulina, HOMA-IR, perfil lipídico e avaliação clínica para diabetes."
+    if "insulina" in e:
+        return "Glicose, hemoglobina glicada, HOMA-IR, triglicerídeos, HDL, cintura e pressão arterial."
+    if "triglicer" in e:
+        return "Perfil lipídico completo, glicose, hemoglobina glicada, TGO, TGP, Gama GT e avaliação de álcool."
+    if "ferritina" in e:
+        return "Ferro sérico, transferrina, saturação de transferrina, PCR, TGO, TGP, Gama GT e hemograma."
+    if "vitamina d" in e:
+        return "Cálcio, fósforo, magnésio, PTH e nova dosagem após intervenção/suplementação."
+    if "vitamina b12" in e:
+        return "Hemograma, VCM, folato, homocisteína e investigação de absorção quando necessário."
+    if "colesterol total" in e or e in ["ldl", "hdl", "vldl"]:
+        return "Perfil lipídico completo, ApoB quando disponível, glicose, HbA1c, PCR e avaliação de risco cardiovascular."
+    if "creatinina" in e or "ureia" in e:
+        return "TFG estimada, urina tipo I, relação albumina/creatinina, hidratação e revisão de suplementos."
+    if "acido urico" in e:
+        return "Função renal, glicose, insulina, triglicerídeos, histórico de gota e consumo de álcool/frutose."
+    if any(t in e for t in ["tgo", "tgp", "gama gt", "fosfatase", "bilirrubina"]):
+        return "TGO, TGP, Gama GT, bilirrubinas, ferritina, triglicerídeos e avaliação de esteatose/álcool."
+    if any(t in e for t in ["hemoglobina", "hemacias"]):
+        return "Ferritina, ferro, transferrina, B12, folato, reticulócitos e investigação clínica."
+    if "leucocitos" in e:
+        return "Hemograma completo, PCR, sintomas recentes e avaliação médica se persistente."
+    if "plaquetas" in e:
+        return "Hemograma repetido, PCR, ferritina, função hepática e avaliação médica."
+    if any(t in e for t in ["sodio", "potassio", "magnesio", "calcio"]):
+        return "Função renal, hidratação, medicamentos, perdas gastrointestinais/suor e repetição do eletrólito."
+    if any(t in e for t in ["tsh", "t4", "t3"]):
+        return "T4 livre, T3 livre, anti-TPO, anti-TG, ferritina, zinco, selênio e avaliação endocrinológica."
+    if "proteina c reativa" in e:
+        return "Hemograma, ferritina, glicose, perfil lipídico, composição corporal e investigação de foco inflamatório."
+
+    return "Repetir exame e avaliar marcadores relacionados conforme hipótese clínica."
+
+
+def _ia_linha_from_item(item):
+    texto = str(item or "").strip()
+
+    if isinstance(item, dict):
+        exame = item.get("exame") or item.get("nome_exame") or item.get("nome") or _ia_exame_por_texto(str(item))
+        direcao = _ia_direcao(item.get("status") or item.get("interpretacao") or item.get("mensagem") or texto)
+    else:
+        exame = _ia_exame_por_texto(texto)
+        direcao = _ia_direcao(texto)
+
+    return {
+        "exame": exame,
+        "interpretacao": _ia_interpretacao(direcao),
+        "possivel": _ia_possivel_alteracao(exame, direcao),
+        "conduta": _ia_conduta_nutricional(exame, direcao),
+        "complementares": _ia_complementares(exame, direcao),
+    }
+
+
+def _nutri_tabela_analise_a_partir_de_insights(itens):
+    linhas = []
+
+    for item in itens or []:
+        texto = str(item or "").strip()
+        n = _ia_norm(texto)
+
+        # Evita transformar insights de hábitos gerais em exames laboratoriais.
+        if any(t in n for t in ["recordatorio", "belisco", "agua", "sono", "atividade fisica", "fim de semana"]):
+            continue
+
+        linhas.append(_ia_linha_from_item(item))
+
+    if not linhas:
+        return ft.Container(
+            padding=16,
+            border_radius=12,
+            bgcolor="#F8FAFC",
+            content=ft.Text(
+                "Nenhum exame alterado para análise nutricional específica.",
+                size=12,
+                color="#64748B",
+            ),
+        )
+
+    return ft.Container(
+        padding=8,
+        border_radius=12,
+        bgcolor="#F8FAFC",
+        content=ft.DataTable(
+            columns=[
+                ft.DataColumn(_nutri_cell_tabela("Exame", 130, negrito=True)),
+                ft.DataColumn(_nutri_cell_tabela("Interpretação", 150, negrito=True)),
+                ft.DataColumn(_nutri_cell_tabela("Possível alteração", 250, negrito=True)),
+                ft.DataColumn(_nutri_cell_tabela("Conduta / possível tratamento nutricional", 360, negrito=True)),
+                ft.DataColumn(_nutri_cell_tabela("Complementares", 290, negrito=True)),
+            ],
+            rows=[
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(_nutri_cell_tabela(linha["exame"], 130)),
+                        ft.DataCell(_nutri_cell_tabela(linha["interpretacao"], 150)),
+                        ft.DataCell(_nutri_cell_tabela(linha["possivel"], 250)),
+                        ft.DataCell(_nutri_cell_tabela(linha["conduta"], 360)),
+                        ft.DataCell(_nutri_cell_tabela(linha["complementares"], 290)),
+                    ]
+                )
+                for linha in linhas
+            ],
+        ),
+    )
+
+# ===== FIM PATCH ANALISE INTELIGENTE: CONDUTAS ESPECIFICAS =====
+
+
+# ===== PATCH UX ANALISE INTELIGENTE: TABELA COM SCROLL HORIZONTAL =====
+
+def _ia_scroll_horizontal_value():
+    try:
+        return ft.ScrollMode.AUTO
+    except Exception:
+        return "auto"
+
+
+def _ia_tabela_cell(texto, largura=160, negrito=False, tamanho=11):
+    return ft.Container(
+        width=largura,
+        padding=6,
+        content=ft.Text(
+            str(texto or "-"),
+            size=tamanho,
+            weight=ft.FontWeight.BOLD if negrito else ft.FontWeight.NORMAL,
+            color="#111827" if negrito else "#374151",
+            no_wrap=False,
+            max_lines=None,
+            overflow=ft.TextOverflow.VISIBLE,
+        ),
+    )
+
+
+def _nutri_tabela_analise_a_partir_de_insights(itens):
+    linhas = []
+
+    for item in itens or []:
+        texto = str(item or "").strip()
+        n = _ia_norm(texto)
+
+        # Evita que resumos e hábitos gerais entrem como se fossem exames.
+        if any(t in n for t in [
+            "resumo",
+            "recordatorio",
+            "belisco",
+            "agua",
+            "sono",
+            "atividade fisica",
+            "fim de semana",
+            "exame s analisado",
+            "result fora",
+        ]):
+            continue
+
+        linha = _ia_linha_from_item(item)
+
+        exame_norm = _ia_norm(linha.get("exame"))
+        if exame_norm in ["resumo", "exame", ""]:
+            continue
+
+        linhas.append(linha)
+
+    if not linhas:
+        return ft.Container(
+            padding=16,
+            border_radius=12,
+            bgcolor="#F8FAFC",
+            content=ft.Text(
+                "Nenhum exame alterado para análise nutricional específica.",
+                size=12,
+                color="#64748B",
+            ),
+        )
+
+    tabela = ft.DataTable(
+        columns=[
+            ft.DataColumn(_ia_tabela_cell("Exame", 120, negrito=True, tamanho=10)),
+            ft.DataColumn(_ia_tabela_cell("Interpretação", 125, negrito=True, tamanho=10)),
+            ft.DataColumn(_ia_tabela_cell("Possível alteração", 240, negrito=True, tamanho=10)),
+            ft.DataColumn(_ia_tabela_cell("Conduta / possível tratamento nutricional", 330, negrito=True, tamanho=10)),
+            ft.DataColumn(_ia_tabela_cell("Complementares", 260, negrito=True, tamanho=10)),
+        ],
+        rows=[
+            ft.DataRow(
+                cells=[
+                    ft.DataCell(_ia_tabela_cell(linha["exame"], 120)),
+                    ft.DataCell(_ia_tabela_cell(linha["interpretacao"], 125)),
+                    ft.DataCell(_ia_tabela_cell(linha["possivel"], 240)),
+                    ft.DataCell(_ia_tabela_cell(linha["conduta"], 330)),
+                    ft.DataCell(_ia_tabela_cell(linha["complementares"], 260)),
+                ]
+            )
+            for linha in linhas
+        ],
+        column_spacing=12,
+        horizontal_margin=8,
+    )
+
+    return ft.Container(
+        padding=8,
+        border_radius=12,
+        bgcolor="#F8FAFC",
+        content=ft.Column(
+            spacing=8,
+            controls=[
+                ft.Text(
+                    "Análise inteligente por exame",
+                    size=13,
+                    weight=ft.FontWeight.BOLD,
+                    color="#111827",
+                ),
+                ft.Text(
+                    "Role horizontalmente para visualizar todas as colunas.",
+                    size=11,
+                    color="#64748B",
+                ),
+                ft.Row(
+                    scroll=_ia_scroll_horizontal_value(),
+                    controls=[tabela],
+                ),
+            ],
+        ),
+    )
+
+# ===== FIM PATCH UX ANALISE INTELIGENTE: TABELA COM SCROLL HORIZONTAL =====
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ===== PATCH PERFORMANCE WINDOWS: CACHE CSV E LISTAS =====
+
+# Objetivo:
+# Reduzir lentidão no Windows evitando releitura excessiva dos CSVs,
+# reconstrução repetida de índices e recálculo da lista de exames a cada atualização visual.
+
+_PERF_CSV_CACHE = {}
+_PERF_REFS_CACHE = {"key": None, "value": None}
+_PERF_PACIENTES_CACHE = {"key": None, "value": None}
+_PERF_CADASTRADOS_CACHE = {"key": None, "value": None}
+_PERF_DISPONIVEIS_CACHE = {}
+_PERF_BLOQUEADOS_CACHE = {}
+_PERF_SYNC_CACHE = {"key": None, "value": None}
+_PERF_PACIENTES_UI_CACHE = {"key": None, "value": None}
+
+
+def _perf_mtime(nome_csv):
+    try:
+        caminho = _patch_data_dir() / nome_csv
+        if caminho.exists():
+            return caminho.stat().st_mtime_ns
+    except Exception:
+        pass
+    return 0
+
+
+def _perf_key_base():
+    return (
+        _perf_mtime("pacientes.csv"),
+        _perf_mtime("exames.csv"),
+        _perf_mtime("analise_exames.csv"),
+        _perf_mtime("referencias_exames.csv"),
+        _perf_mtime("alias_exames.csv"),
+    )
+
+
+def _perf_limpar_cache(nome_csv=None):
+    global _PERF_CSV_CACHE
+
+    if nome_csv:
+        _PERF_CSV_CACHE.pop(nome_csv, None)
+    else:
+        _PERF_CSV_CACHE.clear()
+
+    _PERF_REFS_CACHE["key"] = None
+    _PERF_REFS_CACHE["value"] = None
+
+    _PERF_PACIENTES_CACHE["key"] = None
+    _PERF_PACIENTES_CACHE["value"] = None
+
+    _PERF_CADASTRADOS_CACHE["key"] = None
+    _PERF_CADASTRADOS_CACHE["value"] = None
+
+    _PERF_SYNC_CACHE["key"] = None
+    _PERF_SYNC_CACHE["value"] = None
+
+    _PERF_PACIENTES_UI_CACHE["key"] = None
+    _PERF_PACIENTES_UI_CACHE["value"] = None
+
+    _PERF_DISPONIVEIS_CACHE.clear()
+    _PERF_BLOQUEADOS_CACHE.clear()
+
+
+def _perf_clone_rows(rows):
+    saida = []
+    for r in rows or []:
+        if isinstance(r, dict):
+            saida.append(dict(r))
+        else:
+            saida.append(r)
+    return saida
+
+
+try:
+    _perf_ler_csv_original
+except NameError:
+    _perf_ler_csv_original = _patch_ler_csv
+
+
+def _patch_ler_csv(nome):
+    mtime = _perf_mtime(nome)
+    cache = _PERF_CSV_CACHE.get(nome)
+
+    if cache and cache.get("mtime") == mtime:
+        return _perf_clone_rows(cache.get("rows", []))
+
+    rows = _perf_ler_csv_original(nome)
+    _PERF_CSV_CACHE[nome] = {
+        "mtime": mtime,
+        "rows": _perf_clone_rows(rows),
+    }
+
+    return _perf_clone_rows(rows)
+
+
+try:
+    _perf_salvar_csv_original
+except NameError:
+    _perf_salvar_csv_original = _patch_salvar_csv
+
+
+def _patch_salvar_csv(nome, rows, campos=None):
+    resultado = _perf_salvar_csv_original(nome, rows, campos)
+    _perf_limpar_cache(nome)
+    return resultado
+
+
+try:
+    _perf_refs_original
+except NameError:
+    _perf_refs_original = _patch_refs
+
+
+def _patch_refs():
+    key = (
+        _perf_mtime("referencias_exames.csv"),
+        _perf_mtime("alias_exames.csv"),
+    )
+
+    if _PERF_REFS_CACHE["key"] == key and _PERF_REFS_CACHE["value"] is not None:
+        return dict(_PERF_REFS_CACHE["value"])
+
+    refs = _perf_refs_original()
+    _PERF_REFS_CACHE["key"] = key
+    _PERF_REFS_CACHE["value"] = dict(refs)
+
+    return dict(refs)
+
+
+try:
+    _perf_pacientes_original
+except NameError:
+    _perf_pacientes_original = _patch_pacientes
+
+
+def _patch_pacientes():
+    key = _perf_mtime("pacientes.csv")
+
+    if _PERF_PACIENTES_CACHE["key"] == key and _PERF_PACIENTES_CACHE["value"] is not None:
+        pacientes, por_id, por_nome = _PERF_PACIENTES_CACHE["value"]
+        return (
+            _perf_clone_rows(pacientes),
+            {k: dict(v) for k, v in por_id.items()},
+            {k: dict(v) for k, v in por_nome.items()},
+        )
+
+    pacientes, por_id, por_nome = _perf_pacientes_original()
+
+    _PERF_PACIENTES_CACHE["key"] = key
+    _PERF_PACIENTES_CACHE["value"] = (
+        _perf_clone_rows(pacientes),
+        {k: dict(v) for k, v in por_id.items()},
+        {k: dict(v) for k, v in por_nome.items()},
+    )
+
+    return pacientes, por_id, por_nome
+
+
+def _perf_data_key(data_exame):
+    try:
+        return _patch_data_iso_cadastro(data_exame)
+    except Exception:
+        return str(data_exame or "").strip()
+
+
+try:
+    _perf_reconstruir_cadastrados_original
+except NameError:
+    _perf_reconstruir_cadastrados_original = _patch_reconstruir_exames_cadastrados_por_data
+
+
+def _patch_reconstruir_exames_cadastrados_por_data():
+    key = (
+        _perf_mtime("analise_exames.csv"),
+        _perf_mtime("referencias_exames.csv"),
+    )
+
+    if _PERF_CADASTRADOS_CACHE["key"] == key and _PERF_CADASTRADOS_CACHE["value"] is not None:
+        cadastrados = {
+            k: list(v)
+            for k, v in _PERF_CADASTRADOS_CACHE["value"].items()
+        }
+        globals()["EXAMES_CADASTRADOS_MOCK"] = cadastrados
+        return cadastrados
+
+    cadastrados = _perf_reconstruir_cadastrados_original()
+
+    _PERF_CADASTRADOS_CACHE["key"] = key
+    _PERF_CADASTRADOS_CACHE["value"] = {
+        k: list(v)
+        for k, v in (cadastrados or {}).items()
+    }
+
+    return cadastrados
+
+
+try:
+    _perf_sync_resultados_original
+except NameError:
+    _perf_sync_resultados_original = sincronizar_resultados_exames_mock_data_flet
+
+
+def sincronizar_resultados_exames_mock_data_flet():
+    key = (
+        _perf_mtime("analise_exames.csv"),
+        _perf_mtime("referencias_exames.csv"),
+    )
+
+    if _PERF_SYNC_CACHE["key"] == key and _PERF_SYNC_CACHE["value"] is not None:
+        resultados = _PERF_SYNC_CACHE["value"]
+        globals()["RESULTADOS_EXAMES_MOCK"] = resultados
+
+        try:
+            _patch_reconstruir_exames_cadastrados_por_data()
+        except Exception:
+            pass
+
+        return resultados
+
+    resultados = _perf_sync_resultados_original()
+
+    _PERF_SYNC_CACHE["key"] = key
+    _PERF_SYNC_CACHE["value"] = resultados
+
+    return resultados
+
+
+try:
+    _perf_atualizar_pacientes_original
+except NameError:
+    _perf_atualizar_pacientes_original = atualizar_pacientes_csv_real_definitivo
+
+
+def atualizar_pacientes_csv_real_definitivo():
+    key = (
+        _perf_mtime("pacientes.csv"),
+        _perf_mtime("analise_exames.csv"),
+        _perf_mtime("referencias_exames.csv"),
+    )
+
+    if _PERF_PACIENTES_UI_CACHE["key"] == key and _PERF_PACIENTES_UI_CACHE["value"] is not None:
+        pacientes = _perf_clone_rows(_PERF_PACIENTES_UI_CACHE["value"])
+        globals()["PACIENTES_MOCK"] = pacientes
+        return pacientes
+
+    pacientes = _perf_atualizar_pacientes_original()
+
+    _PERF_PACIENTES_UI_CACHE["key"] = key
+    _PERF_PACIENTES_UI_CACHE["value"] = _perf_clone_rows(pacientes)
+
+    return pacientes
+
+
+try:
+    _perf_disponiveis_original
+except NameError:
+    _perf_disponiveis_original = exames_disponiveis_por_data
+
+
+def exames_disponiveis_por_data(paciente_id, data_exame):
+    pid = str(paciente_id or "").strip()
+    if pid.isdigit() and len(pid) < 4:
+        pid = pid.zfill(4)
+
+    key = (
+        pid,
+        _perf_data_key(data_exame),
+        _perf_mtime("analise_exames.csv"),
+        _perf_mtime("referencias_exames.csv"),
+    )
+
+    if key in _PERF_DISPONIVEIS_CACHE:
+        return _perf_clone_rows(_PERF_DISPONIVEIS_CACHE[key])
+
+    lista = _perf_disponiveis_original(paciente_id, data_exame)
+    _PERF_DISPONIVEIS_CACHE[key] = _perf_clone_rows(lista)
+
+    return _perf_clone_rows(lista)
+
+
+try:
+    _perf_bloqueados_original
+except NameError:
+    _perf_bloqueados_original = exames_ja_cadastrados_por_data
+
+
+def exames_ja_cadastrados_por_data(paciente_id, data_exame):
+    pid = str(paciente_id or "").strip()
+    if pid.isdigit() and len(pid) < 4:
+        pid = pid.zfill(4)
+
+    key = (
+        pid,
+        _perf_data_key(data_exame),
+        _perf_mtime("analise_exames.csv"),
+        _perf_mtime("referencias_exames.csv"),
+    )
+
+    if key in _PERF_BLOQUEADOS_CACHE:
+        return _perf_clone_rows(_PERF_BLOQUEADOS_CACHE[key])
+
+    lista = _perf_bloqueados_original(paciente_id, data_exame)
+    _PERF_BLOQUEADOS_CACHE[key] = _perf_clone_rows(lista)
+
+    return _perf_clone_rows(lista)
+
+print("[PERFORMANCE WINDOWS] Cache de CSV/listas ativado.")
+
+# ===== FIM PATCH PERFORMANCE WINDOWS: CACHE CSV E LISTAS =====
+
+
+
+
+
+
+# Fallbacks de cores para patches adicionais
+if "COR_SUCESSO" not in globals():
+    COR_SUCESSO = "#16A34A"
+
+if "COR_ALERTA" not in globals():
+    COR_ALERTA = "#F59E0B"
+
+if "COR_CRITICO" not in globals():
+    COR_CRITICO = "#DC2626"
+
+if "COR_TEXTO" not in globals():
+    COR_TEXTO = "#111827"
+
+if "COR_TEXTO_FRACO" not in globals():
+    COR_TEXTO_FRACO = "#64748B"
+
+# ===== PATCH EXCLUIR EXAME CADASTRADO ERRADO =====
+
+def _del_exame_nome(item):
+    if not isinstance(item, dict):
+        return str(item or "").strip()
+
+    try:
+        nome = _patch_nome_exame(item)
+        if nome:
+            return nome
+    except Exception:
+        pass
+
+    try:
+        nome = nome_exame_para_exibicao(item)
+        if nome:
+            return nome
+    except Exception:
+        pass
+
+    return str(
+        item.get("nome_exame")
+        or item.get("nome_padronizado")
+        or item.get("nome")
+        or item.get("exame")
+        or item.get("exame_nome")
+        or item.get("id")
+        or ""
+    ).strip()
+
+
+def _del_exame_tokens(item):
+    nome = _del_exame_nome(item)
+
+    tokens = set()
+
+    if nome:
+        tokens.add(_patch_norm(nome))
+        tokens.add(_patch_id_canonico_exame(nome) if "_patch_id_canonico_exame" in globals() else _patch_norm(nome))
+
+    if isinstance(item, dict):
+        for campo in ["id", "id_canonico", "exame_id", "nome_exame", "nome_padronizado", "nome", "exame", "exame_nome"]:
+            valor = str(item.get(campo) or "").strip()
+            if valor:
+                tokens.add(_patch_norm(valor))
+                if "_patch_id_canonico_exame" in globals():
+                    tokens.add(_patch_id_canonico_exame(valor))
+
+    try:
+        ref = _patch_ref(nome)
+        ref_id = _patch_get(ref, "id")
+        ref_nome = _patch_get(ref, "nome_exame", "nome")
+
+        if ref_id:
+            tokens.add(_patch_norm(ref_id))
+            if "_patch_id_canonico_exame" in globals():
+                tokens.add(_patch_id_canonico_exame(ref_id))
+
+        if ref_nome:
+            tokens.add(_patch_norm(ref_nome))
+            if "_patch_id_canonico_exame" in globals():
+                tokens.add(_patch_id_canonico_exame(ref_nome))
+    except Exception:
+        pass
+
+    return {t for t in tokens if t}
+
+
+def _del_linha_exame_match(row, paciente_id, data_exame, tokens):
+    pid = _patch_get(row, "paciente_id", "id_paciente")
+
+    if pid.isdigit() and len(pid) < 4:
+        pid = pid.zfill(4)
+
+    paciente_id = str(paciente_id or "").strip()
+    if paciente_id.isdigit() and len(paciente_id) < 4:
+        paciente_id = paciente_id.zfill(4)
+
+    if pid != paciente_id:
+        return False
+
+    data_row = _patch_data_iso_cadastro(_patch_data_exame(row))
+    data_alvo = _patch_data_iso_cadastro(data_exame)
+
+    if data_row != data_alvo:
+        return False
+
+    row_tokens = _del_exame_tokens(row)
+
+    return bool(row_tokens & tokens)
+
+
+def excluir_exame_cadastrado_errado(paciente_id, data_exame, exame):
+    tokens = _del_exame_tokens(exame)
+    nome = _del_exame_nome(exame)
+
+    if not paciente_id or not data_exame or not tokens:
+        print("[EXCLUIR EXAME] Exclusão cancelada: dados insuficientes.", paciente_id, data_exame, nome)
+        return 0
+
+    total_removido = 0
+
+    for nome_csv in ["exames.csv", "analise_exames.csv"]:
+        rows = _patch_ler_csv(nome_csv)
+        campos = _patch_campos_csv(nome_csv)
+
+        novas = []
+        removidos = 0
+
+        for row in rows:
+            if _del_linha_exame_match(row, paciente_id, data_exame, tokens):
+                removidos += 1
+            else:
+                novas.append(row)
+
+        if removidos:
+            _patch_salvar_csv(nome_csv, novas, campos)
+            total_removido += removidos
+            print(f"[EXCLUIR EXAME] {nome_csv}: {removidos} registro(s) removido(s).")
+
+    try:
+        if "_perf_limpar_cache" in globals():
+            _perf_limpar_cache()
+    except Exception as exc:
+        print(f"[EXCLUIR EXAME] Falha ao limpar cache: {exc}")
+
+    try:
+        sincronizar_resultados_exames_mock_data_flet()
+    except Exception as exc:
+        print(f"[EXCLUIR EXAME] Falha ao sincronizar resultados: {exc}")
+
+    try:
+        atualizar_pacientes_csv_real_definitivo()
+    except Exception as exc:
+        print(f"[EXCLUIR EXAME] Falha ao atualizar pacientes: {exc}")
+
+    print(f"[EXCLUIR EXAME] Exclusão concluída: paciente={paciente_id} | data={data_exame} | exame={nome} | total={total_removido}")
+    return total_removido
+
+
+def exame_bloqueado_card_com_exclusao(page, exame, paciente_id, data_exame, atualizar_callback=None):
+    nome = _del_exame_nome(exame)
+
+    try:
+        detalhe_ref = montar_detalhe_referencia_exame(exame)
+    except Exception:
+        detalhe_ref = {
+            "grupo": exame.get("grupo", "") if isinstance(exame, dict) else "",
+            "referencia": exame.get("referencia", "") if isinstance(exame, dict) else "",
+            "fonte": exame.get("fonte", "") if isinstance(exame, dict) else "",
+        }
+
+    grupo = detalhe_ref.get("grupo") or ""
+    referencia = detalhe_ref.get("referencia") or ""
+    fonte = detalhe_ref.get("fonte") or ""
+
+    def abrir_confirmacao(e):
+        dialog = None
+
+        def fechar(ev=None):
+            dialog.open = False
+            page.update()
+
+        def apagar(ev=None):
+            total = excluir_exame_cadastrado_errado(paciente_id, data_exame, exame)
+
+            dialog.open = False
+
+            if total:
+                try:
+                    mostrar_snackbar(page, f'Exame "{nome}" apagado com sucesso.', COR_SUCESSO)
+                except Exception:
+                    pass
+            else:
+                try:
+                    mostrar_snackbar(page, f'Não encontrei registros para apagar do exame "{nome}".', COR_ALERTA)
+                except Exception:
+                    pass
+
+            if atualizar_callback:
+                atualizar_callback()
+
+            page.update()
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Apagar exame cadastrado?"),
+            content=ft.Text(
+                f'Deseja apagar o exame "{nome}" cadastrado em {data_exame}?\n\n'
+                "Esta ação remove o resultado do histórico e da análise nutricional."
+            ),
+            actions=[
+                ft.TextButton("Cancelar", on_click=fechar),
+                ft.ElevatedButton(
+                    "Apagar exame",
+                    icon=ft.Icons.DELETE_OUTLINE,
+                    bgcolor=COR_CRITICO,
+                    color="#FFFFFF",
+                    on_click=apagar,
+                ),
+            ],
+        )
+
+        page.dialog = dialog
+        dialog.open = True
+        page.update()
+
+    return ft.Container(
+        padding=12,
+        border_radius=16,
+        bgcolor="#F8FAFC",
+        content=ft.Row(
+            spacing=12,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Container(
+                    width=40,
+                    height=40,
+                    border_radius=12,
+                    bgcolor="#DCFCE7",
+                    content=ft.Icon(ft.Icons.CHECK_CIRCLE, color=COR_SUCESSO, size=22),
+                ),
+                ft.Container(
+                    expand=True,
+                    content=ft.Column(
+                        spacing=3,
+                        controls=[
+                            ft.Text(nome, size=14, weight=ft.FontWeight.BOLD, color=COR_TEXTO),
+                            ft.Text(
+                                f"{grupo} • Ref.: {referencia}",
+                                size=11,
+                                color=COR_TEXTO_FRACO,
+                                max_lines=1,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),
+                            ft.Text(
+                                f"Fonte: {fonte}",
+                                size=10,
+                                color=COR_TEXTO_FRACO,
+                                max_lines=1,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),
+                        ],
+                    ),
+                ),
+                ft.Column(
+                    spacing=6,
+                    horizontal_alignment=ft.CrossAxisAlignment.END,
+                    controls=[
+                        ft.Container(
+                            padding=8,
+                            border_radius=999,
+                            bgcolor="#6B7280",
+                            content=ft.Text(
+                                "JÁ CADASTRADO",
+                                size=10,
+                                weight=ft.FontWeight.BOLD,
+                                color="#FFFFFF",
+                            ),
+                        ),
+                        ft.OutlinedButton(
+                            content="Apagar",
+                            icon=ft.Icons.DELETE_OUTLINE,
+                            on_click=abrir_confirmacao,
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    )
+
+# ===== FIM PATCH EXCLUIR EXAME CADASTRADO ERRADO =====
+
+
+
+
+
+# ===== PATCH FIX BOTAO APAGAR EXAME: DIALOG COMPATIVEL =====
+
+def _del_abrir_dialog_compat(page, dialog):
+    """
+    Compatível com versões novas e antigas do Flet.
+    Algumas versões não exibem AlertDialog via page.dialog = dialog.
+    """
+    try:
+        print("[EXCLUIR EXAME] Abrindo diálogo de confirmação...")
+    except Exception:
+        pass
+
+    try:
+        page.open(dialog)
+        return
+    except Exception:
+        pass
+
+    try:
+        if dialog not in page.overlay:
+            page.overlay.append(dialog)
+        dialog.open = True
+        page.update()
+        return
+    except Exception:
+        pass
+
+    try:
+        page.dialog = dialog
+        dialog.open = True
+        page.update()
+    except Exception as exc:
+        print(f"[EXCLUIR EXAME] Falha ao abrir diálogo: {exc}")
+
+
+def _del_fechar_dialog_compat(page, dialog):
+    try:
+        page.close(dialog)
+        return
+    except Exception:
+        pass
+
+    try:
+        dialog.open = False
+        page.update()
+    except Exception:
+        pass
+
+
+def _del_button_texto(label, on_click=None):
+    try:
+        return ft.TextButton(text=label, on_click=on_click)
+    except TypeError:
+        return ft.TextButton(label, on_click=on_click)
+
+
+def _del_button_apagar(label, on_click=None):
+    try:
+        return ft.FilledButton(
+            text=label,
+            icon=ft.Icons.DELETE_OUTLINE,
+            on_click=on_click,
+        )
+    except Exception:
+        try:
+            return ft.ElevatedButton(
+                label,
+                icon=ft.Icons.DELETE_OUTLINE,
+                bgcolor=globals().get("COR_CRITICO", "#DC2626"),
+                color="#FFFFFF",
+                on_click=on_click,
+            )
+        except Exception:
+            return ft.TextButton(label, on_click=on_click)
+
+
+def exame_bloqueado_card_com_exclusao(page, exame, paciente_id, data_exame, atualizar_callback=None):
+    nome = _del_exame_nome(exame)
+
+    try:
+        detalhe_ref = montar_detalhe_referencia_exame(exame)
+    except Exception:
+        detalhe_ref = {
+            "grupo": exame.get("grupo", "") if isinstance(exame, dict) else "",
+            "referencia": exame.get("referencia", "") if isinstance(exame, dict) else "",
+            "fonte": exame.get("fonte", "") if isinstance(exame, dict) else "",
+        }
+
+    grupo = detalhe_ref.get("grupo") or ""
+    referencia = detalhe_ref.get("referencia") or ""
+    fonte = detalhe_ref.get("fonte") or ""
+
+    def executar_exclusao(ev=None, dialog=None):
+        print(f"[EXCLUIR EXAME] Confirmado apagar: paciente={paciente_id} | data={data_exame} | exame={nome}")
+
+        total = excluir_exame_cadastrado_errado(paciente_id, data_exame, exame)
+
+        if dialog is not None:
+            _del_fechar_dialog_compat(page, dialog)
+
+        if total:
+            try:
+                mostrar_snackbar(page, f'Exame "{nome}" apagado com sucesso.', globals().get("COR_SUCESSO", "#16A34A"))
+            except Exception:
+                pass
+        else:
+            try:
+                mostrar_snackbar(page, f'Não encontrei registros para apagar do exame "{nome}".', globals().get("COR_ALERTA", "#F59E0B"))
+            except Exception:
+                pass
+
+        try:
+            if atualizar_callback:
+                atualizar_callback()
+            else:
+                page.update()
+        except Exception as exc:
+            print(f"[EXCLUIR EXAME] Falha ao atualizar tela após apagar: {exc}")
+            try:
+                page.update()
+            except Exception:
+                pass
+
+    def abrir_confirmacao(e=None):
+        print(f"[EXCLUIR EXAME] Clique no botão Apagar: paciente={paciente_id} | data={data_exame} | exame={nome}")
+
+        dialog = None
+
+        def cancelar(ev=None):
+            _del_fechar_dialog_compat(page, dialog)
+
+        def confirmar(ev=None):
+            executar_exclusao(ev, dialog)
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Apagar exame cadastrado?"),
+            content=ft.Text(
+                f'Deseja apagar o exame "{nome}" cadastrado em {data_exame}?\n\n'
+                "Esta ação remove o resultado do histórico e da análise nutricional."
+            ),
+            actions=[
+                _del_button_texto("Cancelar", on_click=cancelar),
+                _del_button_apagar("Apagar exame", on_click=confirmar),
+            ],
+        )
+
+        _del_abrir_dialog_compat(page, dialog)
+
+    return ft.Container(
+        padding=12,
+        border_radius=16,
+        bgcolor="#F8FAFC",
+        content=ft.Row(
+            spacing=12,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Container(
+                    width=40,
+                    height=40,
+                    border_radius=12,
+                    bgcolor="#DCFCE7",
+                    content=ft.Icon(ft.Icons.CHECK_CIRCLE, color=globals().get("COR_SUCESSO", "#16A34A"), size=22),
+                ),
+                ft.Container(
+                    expand=True,
+                    content=ft.Column(
+                        spacing=3,
+                        controls=[
+                            ft.Text(nome, size=14, weight=ft.FontWeight.BOLD, color=globals().get("COR_TEXTO", "#111827")),
+                            ft.Text(
+                                f"{grupo} • Ref.: {referencia}",
+                                size=11,
+                                color=globals().get("COR_TEXTO_FRACO", "#64748B"),
+                                max_lines=1,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),
+                            ft.Text(
+                                f"Fonte: {fonte}",
+                                size=10,
+                                color=globals().get("COR_TEXTO_FRACO", "#64748B"),
+                                max_lines=1,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),
+                        ],
+                    ),
+                ),
+                ft.Column(
+                    spacing=6,
+                    horizontal_alignment=ft.CrossAxisAlignment.END,
+                    controls=[
+                        ft.Container(
+                            padding=8,
+                            border_radius=999,
+                            bgcolor="#6B7280",
+                            content=ft.Text(
+                                "JÁ CADASTRADO",
+                                size=10,
+                                weight=ft.FontWeight.BOLD,
+                                color="#FFFFFF",
+                            ),
+                        ),
+                        ft.OutlinedButton(
+                            content="Apagar",
+                            icon=ft.Icons.DELETE_OUTLINE,
+                            on_click=abrir_confirmacao,
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    )
+
+# ===== FIM PATCH FIX BOTAO APAGAR EXAME: DIALOG COMPATIVEL =====
+
+
+
+
+
+# ===== PATCH FIX EXCLUSAO EXAME: CSV MEMORIA VIEW =====
+
+def _del_tokens_linha_robusto(row):
+    tokens = set()
+
+    if isinstance(row, dict):
+        for campo in [
+            "nome_exame", "nome_padronizado", "exame_nome",
+            "exame", "nome", "id", "id_canonico", "exame_id"
+        ]:
+            valor = str(row.get(campo) or "").strip()
+            if valor:
+                tokens.add(_patch_norm(valor))
+                try:
+                    tokens.add(_patch_id_canonico_exame(valor))
+                except Exception:
+                    pass
+
+        nome = (
+            row.get("nome_exame")
+            or row.get("nome_padronizado")
+            or row.get("exame_nome")
+            or row.get("exame")
+            or row.get("nome")
+            or ""
+        )
+
+        try:
+            ref = _patch_ref(nome)
+            for campo in ["id", "nome", "nome_exame"]:
+                valor = _patch_get(ref, campo)
+                if valor:
+                    tokens.add(_patch_norm(valor))
+                    try:
+                        tokens.add(_patch_id_canonico_exame(valor))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    else:
+        texto = str(row or "").strip()
+        if texto:
+            tokens.add(_patch_norm(texto))
+            try:
+                tokens.add(_patch_id_canonico_exame(texto))
+            except Exception:
+                pass
+
+    return {t for t in tokens if t}
+
+
+def _del_match_exame_robusto(row, paciente_id, data_exame, tokens_alvo):
+    if not isinstance(row, dict):
+        return False
+
+    pid_row = _patch_get(row, "paciente_id", "id_paciente")
+
+    if pid_row.isdigit() and len(pid_row) < 4:
+        pid_row = pid_row.zfill(4)
+
+    pid_alvo = str(paciente_id or "").strip()
+    if pid_alvo.isdigit() and len(pid_alvo) < 4:
+        pid_alvo = pid_alvo.zfill(4)
+
+    if pid_row != pid_alvo:
+        return False
+
+    data_row = _patch_data_iso_cadastro(_patch_data_exame(row))
+    data_alvo = _patch_data_iso_cadastro(data_exame)
+
+    if data_row != data_alvo:
+        return False
+
+    tokens_row = _del_tokens_linha_robusto(row)
+
+    if tokens_row & tokens_alvo:
+        return True
+
+    # Fallback para nomes parecidos.
+    for a in tokens_alvo:
+        for b in tokens_row:
+            if a and b and (a in b or b in a):
+                return True
+
+    return False
+
+
+def _del_limpar_memoria_e_cache_exame(paciente_id, data_exame, tokens_alvo):
+    for nome_global in ["RESULTADOS_EXAMES_MOCK"]:
+        lista = globals().get(nome_global)
+        if isinstance(lista, list):
+            antes = len(lista)
+            lista[:] = [
+                r for r in lista
+                if not _del_match_exame_robusto(r, paciente_id, data_exame, tokens_alvo)
+            ]
+            depois = len(lista)
+            if antes != depois:
+                print(f"[EXCLUIR EXAME] Memória {nome_global}: {antes - depois} removido(s).")
+
+    globals()["EXAMES_CADASTRADOS_MOCK"] = {}
+
+    try:
+        if "_perf_limpar_cache" in globals():
+            _perf_limpar_cache()
+    except Exception as exc:
+        print(f"[EXCLUIR EXAME] Falha ao limpar cache de performance: {exc}")
+
+    for nome_cache in [
+        "_PERF_CSV_CACHE",
+        "_PERF_DISPONIVEIS_CACHE",
+        "_PERF_BLOQUEADOS_CACHE",
+    ]:
+        try:
+            cache = globals().get(nome_cache)
+            if hasattr(cache, "clear"):
+                cache.clear()
+        except Exception:
+            pass
+
+    for nome_cache in [
+        "_PERF_REFS_CACHE",
+        "_PERF_PACIENTES_CACHE",
+        "_PERF_CADASTRADOS_CACHE",
+        "_PERF_SYNC_CACHE",
+        "_PERF_PACIENTES_UI_CACHE",
+    ]:
+        try:
+            cache = globals().get(nome_cache)
+            if isinstance(cache, dict):
+                cache["key"] = None
+                cache["value"] = None
+        except Exception:
+            pass
+
+
+def excluir_exame_cadastrado_errado(paciente_id, data_exame, exame):
+    tokens = _del_exame_tokens(exame)
+    tokens.update(_del_tokens_linha_robusto(exame))
+
+    nome = _del_exame_nome(exame)
+
+    if not paciente_id or not data_exame or not tokens:
+        print("[EXCLUIR EXAME] Exclusão cancelada: dados insuficientes.", paciente_id, data_exame, nome)
+        return 0
+
+    print(f"[EXCLUIR EXAME] Iniciando exclusão robusta: paciente={paciente_id} | data={data_exame} | exame={nome}")
+    print(f"[EXCLUIR EXAME] Tokens usados: {sorted(tokens)}")
+
+    total_removido = 0
+
+    for nome_csv in ["exames.csv", "analise_exames.csv"]:
+        rows = _patch_ler_csv(nome_csv)
+        campos = _patch_campos_csv(nome_csv)
+
+        novas = []
+        removidos = 0
+
+        for row in rows:
+            if _del_match_exame_robusto(row, paciente_id, data_exame, tokens):
+                removidos += 1
+                print(f"[EXCLUIR EXAME] Removendo de {nome_csv}: {row}")
+            else:
+                novas.append(row)
+
+        if removidos:
+            _patch_salvar_csv(nome_csv, novas, campos)
+            total_removido += removidos
+            print(f"[EXCLUIR EXAME] {nome_csv}: {removidos} registro(s) removido(s).")
+        else:
+            print(f"[EXCLUIR EXAME] {nome_csv}: nenhum registro removido.")
+
+    _del_limpar_memoria_e_cache_exame(paciente_id, data_exame, tokens)
+
+    try:
+        sincronizar_resultados_exames_mock_data_flet()
+    except Exception as exc:
+        print(f"[EXCLUIR EXAME] Falha ao sincronizar resultados: {exc}")
+
+    try:
+        atualizar_pacientes_csv_real_definitivo()
+    except Exception as exc:
+        print(f"[EXCLUIR EXAME] Falha ao atualizar pacientes: {exc}")
+
+    print(f"[EXCLUIR EXAME] Exclusão finalizada: paciente={paciente_id} | data={data_exame} | exame={nome} | total={total_removido}")
+    return total_removido
+
+# ===== FIM PATCH FIX EXCLUSAO EXAME: CSV MEMORIA VIEW =====
+
+
+
+
+
+# ===== PATCH FIX NOME EXAME: ALIASES DE EXIBICAO =====
+
+try:
+    _fix_nome_exame_para_exibicao_original
+except NameError:
+    _fix_nome_exame_para_exibicao_original = nome_exame_para_exibicao
+
+
+def nome_exame_para_exibicao(item):
+    if isinstance(item, dict):
+        for campo in [
+            "nome_exame",
+            "exame_nome",
+            "nome_padronizado",
+            "nome",
+            "exame",
+            "analito",
+            "descricao",
+            "id",
+        ]:
+            valor = str(item.get(campo) or "").strip()
+            if valor and valor not in ["-", "None", "null"]:
+                return valor
+
+    try:
+        return _fix_nome_exame_para_exibicao_original(item)
+    except Exception:
+        return "-"
+
+
+try:
+    _fix_patch_nome_exame_original
+except NameError:
+    _fix_patch_nome_exame_original = _patch_nome_exame
+
+
+def _patch_nome_exame(row):
+    if isinstance(row, dict):
+        for campo in [
+            "nome_exame",
+            "exame_nome",
+            "nome_padronizado",
+            "nome",
+            "exame",
+            "analito",
+            "descricao",
+            "id",
+        ]:
+            valor = str(row.get(campo) or "").strip()
+            if valor and valor not in ["-", "None", "null"]:
+                return valor
+
+    try:
+        return _fix_patch_nome_exame_original(row)
+    except Exception:
+        return ""
+
+# ===== FIM PATCH FIX NOME EXAME: ALIASES DE EXIBICAO =====
+
+
+
+
+
+# ===== PATCH FIX MIGRACAO DUPLICADA EXAMES =====
+
+import csv as _dup_csv
+import unicodedata as _dup_unicodedata
+import re as _dup_re
+from pathlib import Path as _dup_Path
+
+
+def _dup_data_dir():
+    return _dup_Path(__file__).resolve().parent / "data_flet"
+
+
+def _dup_norm(valor):
+    texto = str(valor or "").strip().lower()
+    texto = _dup_unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not _dup_unicodedata.combining(c))
+    texto = texto.replace("_", " ").replace("-", " ")
+    texto = _dup_re.sub(r"[^a-z0-9%/., ]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def _dup_get(row, *campos):
+    if not isinstance(row, dict):
+        return ""
+
+    limpo = {
+        str(k or "").replace("\ufeff", "").strip(): "" if v is None else str(v).strip()
+        for k, v in row.items()
+    }
+
+    for c in campos:
+        v = limpo.get(str(c or "").strip(), "")
+        if v:
+            return v
+
+    return ""
+
+
+def _dup_ler_csv(nome):
+    caminho = _dup_data_dir() / nome
+
+    if not caminho.exists():
+        return [], []
+
+    with open(caminho, newline="", encoding="utf-8-sig") as f:
+        reader = _dup_csv.DictReader(f)
+        campos = [
+            str(c or "").replace("\ufeff", "").strip()
+            for c in (reader.fieldnames or [])
+        ]
+        rows = []
+
+        for r in reader:
+            rows.append({
+                str(k or "").replace("\ufeff", "").strip(): "" if v is None else str(v).strip()
+                for k, v in r.items()
+            })
+
+    return campos, rows
+
+
+def _dup_salvar_csv(nome, campos, rows):
+    caminho = _dup_data_dir() / nome
+    tmp = caminho.with_suffix(caminho.suffix + ".tmp")
+
+    campos = list(campos or [])
+
+    for obrigatorio in ["paciente_id", "data_exame", "nome_exame", "resultado", "unidade"]:
+        if obrigatorio not in campos:
+            campos.append(obrigatorio)
+
+    for r in rows:
+        for k in r.keys():
+            if k not in campos:
+                campos.append(k)
+
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        writer = _dup_csv.DictWriter(f, fieldnames=campos, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({c: r.get(c, "") for c in campos})
+
+    tmp.replace(caminho)
+
+
+def _dup_nome_exame(row):
+    nome = _dup_get(
+        row,
+        "nome_exame",
+        "exame_nome",
+        "nome_padronizado",
+        "nome",
+        "exame",
+        "analito",
+        "descricao",
+    )
+
+    if nome and nome not in ["-", "None", "null"]:
+        return nome
+
+    # fallback seguro para glicose, quando veio sem nome mas com referência 70-99 mg/dL
+    unidade = _dup_norm(_dup_get(row, "unidade"))
+    vmin = _dup_norm(_dup_get(row, "valor_min"))
+    vmax = _dup_norm(_dup_get(row, "valor_max"))
+    resultado = _dup_norm(_dup_get(row, "resultado"))
+
+    if unidade == "mg/dl" and vmin == "70" and vmax == "99":
+        return "Glicose"
+
+    if unidade == "mg/dl" and resultado == "237":
+        return "Glicose"
+
+    return nome
+
+
+def _dup_chave(row):
+    pid = _dup_get(row, "paciente_id", "id_paciente")
+
+    if pid.isdigit() and len(pid) < 4:
+        pid = pid.zfill(4)
+
+    data = _dup_get(row, "data_exame", "data")
+    nome = _dup_nome_exame(row)
+    resultado = _dup_get(row, "resultado", "valor")
+    unidade = _dup_get(row, "unidade")
+
+    return (
+        pid,
+        _dup_norm(data),
+        _dup_norm(nome),
+        _dup_norm(resultado),
+        _dup_norm(unidade),
+    )
+
+
+def _dup_deduplicar_csv(nome_csv):
+    campos, rows = _dup_ler_csv(nome_csv)
+
+    if not rows:
+        return 0
+
+    vistos = set()
+    novas = []
+    removidos = 0
+
+    for r in rows:
+        nome = _dup_nome_exame(r)
+
+        if nome:
+            r["nome_exame"] = nome
+
+            if nome_csv == "analise_exames.csv":
+                if not _dup_get(r, "nome_padronizado") or _dup_get(r, "nome_padronizado") in ["-", "None", "null"]:
+                    r["nome_padronizado"] = nome
+
+        chave = _dup_chave(r)
+
+        # Só remove duplicado quando a chave tem os dados mínimos.
+        chave_valida = all([chave[0], chave[1], chave[2], chave[3]])
+
+        if chave_valida and chave in vistos:
+            removidos += 1
+            print(f"[DEDUP EXAMES] Removendo duplicado em {nome_csv}: {r}")
+            continue
+
+        if chave_valida:
+            vistos.add(chave)
+
+        novas.append(r)
+
+    if removidos:
+        _dup_salvar_csv(nome_csv, campos, novas)
+        print(f"[DEDUP EXAMES] {nome_csv}: {removidos} duplicado(s) removido(s).")
+
+    return removidos
+
+
+def deduplicar_exames_e_analises_csv():
+    total = 0
+    total += _dup_deduplicar_csv("exames.csv")
+    total += _dup_deduplicar_csv("analise_exames.csv")
+
+    try:
+        if "_perf_limpar_cache" in globals():
+            _perf_limpar_cache()
+    except Exception:
+        pass
+
+    print(f"[DEDUP EXAMES] Total removido: {total}")
+    return total
+
+
+def _patch_migrar_mock_para_csv():
+    # Desativado intencionalmente.
+    # O salvamento real agora acontece no append via _patch_persistir_resultado_item().
+    # Manter essa migração ativa estava duplicando exames após cada cadastro.
+    return 0
+
+# ===== FIM PATCH FIX MIGRACAO DUPLICADA EXAMES =====
+
+
+
+
+
+
+
+
+
+
+
+# ===== PATCH REFERENCIAS POR SEXO E IDADE =====
+
+import csv as _rsi_csv
+import re as _rsi_re
+import unicodedata as _rsi_unicodedata
+from pathlib import Path as _rsi_Path
+
+
+def _rsi_data_dir():
+    try:
+        return _patch_data_dir()
+    except Exception:
+        return _rsi_Path(__file__).resolve().parent / "data_flet"
+
+
+def _rsi_norm(valor):
+    texto = str(valor or "").strip().lower()
+    texto = _rsi_unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not _rsi_unicodedata.combining(c))
+    texto = texto.replace("_", " ").replace("-", " ")
+    texto = _rsi_re.sub(r"[^a-z0-9%/., ]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def _rsi_float(valor):
+    texto = str(valor or "").strip()
+    if not texto:
+        return None
+
+    texto = texto.replace(" ", "")
+
+    if "," in texto and "." in texto:
+        texto = texto.replace(".", "").replace(",", ".")
+    else:
+        texto = texto.replace(",", ".")
+
+    m = _rsi_re.search(r"[-+]?\d+(?:\.\d+)?", texto)
+    if not m:
+        return None
+
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+
+def _rsi_get(row, *campos):
+    if not isinstance(row, dict):
+        return ""
+
+    limpo = {
+        str(k or "").replace("\ufeff", "").strip(): "" if v is None else str(v).strip()
+        for k, v in row.items()
+    }
+
+    for c in campos:
+        v = limpo.get(str(c or "").strip(), "")
+        if v:
+            return v
+
+    return ""
+
+
+def _rsi_ler_csv(nome):
+    caminho = _rsi_data_dir() / nome
+    if not caminho.exists():
+        return [], []
+
+    with open(caminho, newline="", encoding="utf-8-sig") as f:
+        reader = _rsi_csv.DictReader(f)
+        campos = [
+            str(c or "").replace("\ufeff", "").strip()
+            for c in (reader.fieldnames or [])
+        ]
+        rows = []
+        for r in reader:
+            rows.append({
+                str(k or "").replace("\ufeff", "").strip(): "" if v is None else str(v).strip()
+                for k, v in r.items()
+            })
+
+    return campos, rows
+
+
+def _rsi_salvar_csv(nome, campos, rows):
+    caminho = _rsi_data_dir() / nome
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    tmp = caminho.with_suffix(caminho.suffix + ".tmp")
+
+    campos = list(campos or [])
+    for r in rows:
+        for k in r.keys():
+            if k not in campos:
+                campos.append(k)
+
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        writer = _rsi_csv.DictWriter(f, fieldnames=campos, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({c: r.get(c, "") for c in campos})
+
+    tmp.replace(caminho)
+
+
+def _rsi_id(nome, sexo, idade_min, idade_max):
+    base = _rsi_norm(f"{nome}_{sexo}_{idade_min}_{idade_max}")
+    return _rsi_re.sub(r"[^a-z0-9]+", "_", base).strip("_")
+
+
+def _rsi_row(nome, grupo, sexo, idade_min, idade_max, vmin, vmax, unidade, ref, fonte, fonte_url="", obs=""):
+    return {
+        "referencia_id": _rsi_id(nome, sexo, idade_min, idade_max),
+        "nome_exame": nome,
+        "nome_padronizado": nome,
+        "grupo": grupo,
+        "sexo": sexo,
+        "idade_min": str(idade_min),
+        "idade_max": str(idade_max),
+        "valor_min": "" if vmin is None else str(vmin),
+        "valor_max": "" if vmax is None else str(vmax),
+        "unidade": unidade,
+        "referencia": ref,
+        "referencia_texto": ref,
+        "fonte": fonte,
+        "fonte_referencia": fonte,
+        "fonte_url": fonte_url,
+        "observacoes": obs,
+        "status": "Completa",
+    }
+
+
+def gerar_referencias_exames_sexo_idade():
+    _, base_rows = _rsi_ler_csv("referencias_exames.csv")
+
+    saida = []
+
+    # Exames que receberão linhas específicas, para não herdar valor masculino como "Todos".
+    nomes_com_override = {
+        "eritrocitos", "hemoglobina", "hematocrito", "hcm", "vcm", "chcm", "rdw",
+        "leucocitos", "neutrofilos", "eosinofilos", "basofilos", "linfocitos",
+        "monocitos", "plaquetas", "ferritina", "gama gt", "creatinina",
+        "ferro", "saturacao da transferrina", "vhs", "tsh", "t4 livre",
+        "glicose", "hemoglobina glicada",
+    }
+
+    # 1) Mantém a base atual para exames sem variação relevante por sexo/idade.
+    for r in base_rows:
+        nome = _rsi_get(r, "nome_exame", "nome")
+        grupo = _rsi_get(r, "grupo")
+        unidade = _rsi_get(r, "unidade")
+        ref = _rsi_get(r, "referencia", "referencia_texto")
+        fonte = _rsi_get(r, "fonte", "fonte_referencia") or "Base NutriSoft/Fleury importada"
+        vmin = _rsi_get(r, "valor_min")
+        vmax = _rsi_get(r, "valor_max")
+
+        n = _rsi_norm(nome)
+
+        if n in nomes_com_override:
+            continue
+
+        ref_norm = _rsi_norm(ref)
+
+        # Se a própria referência diz "masculino", não transforma em "Todos".
+        sexo = "Todos"
+        if "masculino" in ref_norm and "feminino" not in ref_norm:
+            sexo = "Masculino"
+        elif "feminino" in ref_norm and "masculino" not in ref_norm:
+            sexo = "Feminino"
+
+        saida.append(_rsi_row(
+            nome, grupo, sexo, 0, 120, vmin, vmax, unidade, ref, fonte,
+            obs="Linha preservada da base original; aplicar por sexo/idade quando houver regra específica."
+        ))
+
+    # 2) Metabolismo glicídico — SBD.
+    fonte_sbd = "Sociedade Brasileira de Diabetes - Diretriz 2025"
+    url_sbd = "https://diretriz.diabetes.org.br/diagnostico-de-diabetes-mellitus/"
+    saida += [
+        _rsi_row("Glicose", "Metabolismo glicídico", "Todos", 18, 120, 70, 99, "mg/dL",
+                 "Adultos não gestantes: 70 a 99 mg/dL; pré-diabetes 100 a 125; diabetes >=126",
+                 fonte_sbd, url_sbd),
+        _rsi_row("Hemoglobina glicada", "Metabolismo glicídico", "Todos", 18, 120, None, 5.69, "%",
+                 "Adultos não gestantes: <5,7%; pré-diabetes 5,7 a 6,4%; diabetes >=6,5%",
+                 fonte_sbd, url_sbd),
+    ]
+
+    # 3) Hemograma — Fleury 2022.
+    fonte_hemo = "Fleury - Novos valores de referência para o hemograma"
+    url_hemo = "https://www.fleury.com.br/artigos-medicos/novos-valores-de-referencia-para-o-hemograma-no-fleury"
+    hemograma = [
+        ("Eritrócitos", "milhões/mm3", 4.32, 5.67, 3.83, 4.99),
+        ("Hemoglobina", "g/dL", 13.3, 16.5, 11.7, 14.9),
+        ("Hematócrito", "%", 39.2, 49.0, 35.1, 44.1),
+        ("HCM", "pg", 27.7, 32.7, 27.7, 32.7),
+        ("VCM", "fL", 81.7, 95.3, 83.1, 96.8),
+        ("CHCM", "g/dL", 32.4, 36.0, 32.0, 35.2),
+        ("RDW", "%", 11.8, 14.1, 11.8, 14.2),
+        ("Leucócitos", "/mm3", 3650, 8120, 3470, 8290),
+        ("Neutrófilos", "/mm3", 1590, 4770, 1526, 5020),
+        ("Eosinófilos", "/mm3", 34, 420, 20, 340),
+        ("Basófilos", "/mm3", 10, 80, 10, 80),
+        ("Linfócitos", "/mm3", 1120, 2950, 1097, 2980),
+        ("Monócitos", "/mm3", 260, 730, 220, 650),
+        ("Plaquetas", "/mm3", 151000, 304000, 163000, 343000),
+    ]
+
+    for nome, unidade, m_min, m_max, f_min, f_max in hemograma:
+        saida.append(_rsi_row(nome, "Hemograma", "Masculino", 18, 120, m_min, m_max, unidade,
+                              f"Masculino adulto: {m_min} a {m_max} {unidade}", fonte_hemo, url_hemo))
+        saida.append(_rsi_row(nome, "Hemograma", "Feminino", 18, 120, f_min, f_max, unidade,
+                              f"Feminino adulto: {f_min} a {f_max} {unidade}", fonte_hemo, url_hemo))
+
+    # 4) Metabolismo do ferro — a+ / Grupo Fleury e MSD quando aplicável.
+    fonte_ferritina = "a+ Medicina Diagnóstica / Grupo Fleury - Ferritina, soro"
+    url_ferritina = "https://www.amaissaude.com.br/pe/exames/ferritina-soro"
+    saida += [
+        _rsi_row("Ferritina", "Metabolismo do ferro", "Masculino", 16, 120, 26, 446, "microg/L",
+                 "Adulto masculino: 26 a 446 microg/L", fonte_ferritina, url_ferritina),
+        _rsi_row("Ferritina", "Metabolismo do ferro", "Feminino", 16, 120, 15, 149, "microg/L",
+                 "Adulto feminino: 15 a 149 microg/L", fonte_ferritina, url_ferritina),
+        _rsi_row("Ferro", "Metabolismo do ferro", "Masculino", 12, 120, 65, 175, "mcg/dL",
+                 "Masculino acima de 12 anos: 65 a 175 mcg/dL", "Minha Vida / consultoria Fleury - Ferro sérico",
+                 "https://www.minhavida.com.br/saude/tratamento/4952-exame-de-ferro"),
+        _rsi_row("Ferro", "Metabolismo do ferro", "Feminino", 12, 120, 50, 170, "mcg/dL",
+                 "Feminino acima de 12 anos: 50 a 170 mcg/dL", "Minha Vida / consultoria Fleury - Ferro sérico",
+                 "https://www.minhavida.com.br/saude/tratamento/4952-exame-de-ferro"),
+        _rsi_row("Saturação da transferrina", "Metabolismo do ferro", "Masculino", 12, 120, 20, 50, "%",
+                 "Masculino: 20 a 50%", "Minha Vida / consultoria Fleury - Saturação da transferrina",
+                 "https://www.minhavida.com.br/saude/tratamento/4952-exame-de-ferro"),
+        _rsi_row("Saturação da transferrina", "Metabolismo do ferro", "Feminino", 12, 120, 15, 50, "%",
+                 "Feminino: 15 a 50%", "Minha Vida / consultoria Fleury - Saturação da transferrina",
+                 "https://www.minhavida.com.br/saude/tratamento/4952-exame-de-ferro"),
+    ]
+
+    # 5) Função renal — Mayo Clinic.
+    fonte_creat = "Mayo Clinic - Creatinine test"
+    url_creat = "https://www.mayoclinic.org/tests-procedures/creatinine-test/about/pac-20384646"
+    saida += [
+        _rsi_row("Creatinina", "Função renal", "Masculino", 18, 120, 0.74, 1.35, "mg/dL",
+                 "Adulto masculino: 0,74 a 1,35 mg/dL", fonte_creat, url_creat),
+        _rsi_row("Creatinina", "Função renal", "Feminino", 18, 120, 0.59, 1.04, "mg/dL",
+                 "Adulto feminino: 0,59 a 1,04 mg/dL", fonte_creat, url_creat),
+    ]
+
+    # 6) Gama GT — Mayo Clinic Laboratories.
+    fonte_ggt = "Mayo Clinic Laboratories - Gamma-glutamyltransferase"
+    url_ggt = "https://pediatric.testcatalog.org/show/GGT"
+    saida += [
+        _rsi_row("Gama GT", "Função hepática", "Masculino", 18, 120, 8, 61, "U/L",
+                 "Masculino >=18 anos: 8 a 61 U/L", fonte_ggt, url_ggt),
+        _rsi_row("Gama GT", "Função hepática", "Feminino", 18, 120, 5, 36, "U/L",
+                 "Feminino >=18 anos: 5 a 36 U/L", fonte_ggt, url_ggt),
+    ]
+
+    # 7) VHS — referência por sexo/idade. Usada apenas como triagem, depende do método.
+    fonte_vhs = "CBDL / ICSH - VHS por sexo e idade"
+    url_vhs = "https://cbdl.org.br/entenda-o-que-e-o-exame-vhs-e-sua-finalidade/"
+    saida += [
+        _rsi_row("VHS", "Inflamação", "Masculino", 0, 49, None, 15, "mm",
+                 "Masculino <50 anos: até 15 mm/h", fonte_vhs, url_vhs),
+        _rsi_row("VHS", "Inflamação", "Feminino", 0, 49, None, 20, "mm",
+                 "Feminino <50 anos: até 20 mm/h", fonte_vhs, url_vhs),
+        _rsi_row("VHS", "Inflamação", "Masculino", 50, 84, None, 20, "mm",
+                 "Masculino 50 a 84 anos: até 20 mm/h", fonte_vhs, url_vhs),
+        _rsi_row("VHS", "Inflamação", "Feminino", 50, 84, None, 30, "mm",
+                 "Feminino 50 a 84 anos: até 30 mm/h", fonte_vhs, url_vhs),
+    ]
+
+    # 8) Tireoide — Fleury, por idade.
+    fonte_tsh = "Fleury - TSH por idade"
+    url_tsh = "https://www.fleury.com.br/noticias/tsh-hormonio-tiroestimulante"
+    saida += [
+        _rsi_row("TSH", "Tireoide", "Todos", 12, 20, 0.51, 4.3, "mUI/L",
+                 "12 a 20 anos: 0,51 a 4,3 mUI/L", fonte_tsh, url_tsh),
+        _rsi_row("TSH", "Tireoide", "Todos", 20, 60, 0.45, 4.5, "mUI/L",
+                 "20 a 60 anos: 0,45 a 4,5 mUI/L", fonte_tsh, url_tsh),
+        _rsi_row("TSH", "Tireoide", "Todos", 60, 69, 0.44, 6.8, "mUI/L",
+                 "60 a 69 anos: 0,44 a 6,8 mUI/L", fonte_tsh, url_tsh),
+        _rsi_row("TSH", "Tireoide", "Todos", 70, 80, 0.44, 7.9, "mUI/L",
+                 "70 a 80 anos: 0,44 a 7,9 mUI/L", fonte_tsh, url_tsh),
+        _rsi_row("TSH", "Tireoide", "Todos", 81, 120, 0.48, 10.4, "mUI/L",
+                 "Acima de 80 anos: 0,48 a 10,4 mUI/L", fonte_tsh, url_tsh),
+    ]
+
+    fonte_t4 = "Fleury - T4 livre por idade"
+    url_t4 = "https://www.fleury.com.br/noticias/t4-livre-o-que-e"
+    saida += [
+        _rsi_row("T4 livre", "Tireoide", "Todos", 12, 20, 1.0, 1.7, "ng/dL",
+                 "12 a 20 anos: 1,0 a 1,7 ng/dL", fonte_t4, url_t4),
+        _rsi_row("T4 livre", "Tireoide", "Todos", 20, 120, 0.9, 1.8, "ng/dL",
+                 "Acima de 20 anos: 0,9 a 1,8 ng/dL", fonte_t4, url_t4),
+    ]
+
+    campos = [
+        "referencia_id", "nome_exame", "nome_padronizado", "grupo", "sexo",
+        "idade_min", "idade_max", "valor_min", "valor_max", "unidade",
+        "referencia", "referencia_texto", "fonte", "fonte_referencia",
+        "fonte_url", "observacoes", "status",
+    ]
+
+    _rsi_salvar_csv("referencias_exames_sexo_idade.csv", campos, saida)
+    print(f"[REF SEXO/IDADE] Base gerada: {len(saida)} linhas em referencias_exames_sexo_idade.csv")
+    return saida
+
+
+def _rsi_paciente_contexto(paciente_id):
+    _, pacientes = _rsi_ler_csv("pacientes.csv")
+
+    pid_alvo = str(paciente_id or "").strip()
+    if pid_alvo.isdigit() and len(pid_alvo) < 4:
+        pid_alvo = pid_alvo.zfill(4)
+
+    for p in pacientes:
+        pid = _rsi_get(p, "paciente_id", "id")
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+
+        if pid == pid_alvo:
+            sexo = _rsi_get(p, "sexo")
+            idade = _rsi_float(_rsi_get(p, "idade"))
+            return {
+                "paciente_id": pid,
+                "sexo": sexo,
+                "idade": idade if idade is not None else 0,
+            }
+
+    return {"paciente_id": pid_alvo, "sexo": "", "idade": 0}
+
+
+def _rsi_sexo_compativel(sexo_ref, sexo_paciente):
+    sr = _rsi_norm(sexo_ref)
+    sp = _rsi_norm(sexo_paciente)
+
+    if sr in ["", "todos", "ambos", "ambos os sexos"]:
+        return True
+
+    if sp.startswith("masc") and sr.startswith("masc"):
+        return True
+
+    if sp.startswith("fem") and sr.startswith("fem"):
+        return True
+
+    return False
+
+
+def _rsi_sexo_peso(sexo_ref, sexo_paciente):
+    sr = _rsi_norm(sexo_ref)
+    sp = _rsi_norm(sexo_paciente)
+
+    if sp.startswith("masc") and sr.startswith("masc"):
+        return 3
+
+    if sp.startswith("fem") and sr.startswith("fem"):
+        return 3
+
+    if sr in ["", "todos", "ambos", "ambos os sexos"]:
+        return 1
+
+    return 0
+
+
+def _rsi_idade_compativel(row, idade):
+    imin = _rsi_float(_rsi_get(row, "idade_min"))
+    imax = _rsi_float(_rsi_get(row, "idade_max"))
+
+    if idade is None:
+        idade = 0
+
+    if imin is not None and idade < imin:
+        return False
+
+    if imax is not None and idade > imax:
+        return False
+
+    return True
+
+
+def _rsi_nome_match(nome_a, nome_b):
+    a = _rsi_norm(nome_a)
+    b = _rsi_norm(nome_b)
+
+    aliases = {
+        "ast/tgo": ["ast tgo", "tgo", "ast"],
+        "alt/tgp": ["alt tgp", "tgp", "alt"],
+        "25-oh vitamina d": ["25 oh vitamina d", "vitamina d", "25oh d3", "25oh d3"],
+        "hdl colesterol": ["hdl", "colesterol hdl"],
+        "ldl colesterol": ["ldl", "colesterol ldl"],
+        "vldl colesterol": ["vldl", "colesterol vldl"],
+        "gama gt": ["ggt", "gama gt", "gamma gt"],
+        "proteína c-reativa ultrassensível": ["pcr", "proteina c reativa", "proteina c reativa ultrassensivel"],
+        "eritrocitos": ["hemacias", "eritrocitos"],
+        "vhs": ["vhs", "hemossedimentacao", "velocidade de hemossedimentacao"],
+    }
+
+    if a == b:
+        return True
+
+    for canon, vals in aliases.items():
+        vals_n = [_rsi_norm(canon)] + [_rsi_norm(v) for v in vals]
+        if a in vals_n and b in vals_n:
+            return True
+
+    return a and b and (a == b or a in b or b in a)
+
+
+def buscar_referencia_sexo_idade(nome_exame, paciente_id=None):
+    caminho = _rsi_data_dir() / "referencias_exames_sexo_idade.csv"
+
+    if not caminho.exists():
+        gerar_referencias_exames_sexo_idade()
+
+    _, refs = _rsi_ler_csv("referencias_exames_sexo_idade.csv")
+    ctx = _rsi_paciente_contexto(paciente_id)
+    sexo = ctx.get("sexo", "")
+    idade = ctx.get("idade", 0)
+
+    candidatas = [
+        r for r in refs
+        if _rsi_nome_match(_rsi_get(r, "nome_exame", "nome_padronizado"), nome_exame)
+        and _rsi_sexo_compativel(_rsi_get(r, "sexo"), sexo)
+        and _rsi_idade_compativel(r, idade)
+    ]
+
+    if not candidatas:
+        return {}
+
+    candidatas.sort(
+        key=lambda r: (
+            -_rsi_sexo_peso(_rsi_get(r, "sexo"), sexo),
+            (_rsi_float(_rsi_get(r, "idade_max")) or 120) - (_rsi_float(_rsi_get(r, "idade_min")) or 0),
+        )
+    )
+
+    return dict(candidatas[0])
+
+
+def analisar_resultado_sexo_idade(nome_exame, resultado, unidade, paciente_id=None):
+    ref = buscar_referencia_sexo_idade(nome_exame, paciente_id)
+
+    if not ref:
+        return {
+            "nome_padronizado": nome_exame,
+            "valor_min": "",
+            "valor_max": "",
+            "status": "Sem análise",
+            "referencia": "",
+            "fonte_referencia": "",
+            "fonte_url": "",
+            "mensagem": f"{nome_exame}: sem referência específica para sexo/idade do paciente.",
+        }
+
+    valor = _rsi_float(resultado)
+    vmin = _rsi_float(_rsi_get(ref, "valor_min"))
+    vmax = _rsi_float(_rsi_get(ref, "valor_max"))
+
+    if valor is None:
+        status = "Sem análise"
+    elif vmin is not None and valor < vmin:
+        status = "Baixo"
+    elif vmax is not None and valor > vmax:
+        status = "Alto"
+    elif vmin is not None or vmax is not None:
+        status = "Normal"
+    else:
+        status = "Sem análise"
+
+    nome_pad = _rsi_get(ref, "nome_padronizado", "nome_exame") or nome_exame
+    ref_txt = _rsi_get(ref, "referencia_texto", "referencia")
+    unidade_ref = unidade or _rsi_get(ref, "unidade")
+
+    msg = f"{nome_pad}: {resultado} {unidade_ref}".strip()
+    msg += f" - {status}"
+    if ref_txt:
+        msg += f". Referência ({_rsi_get(ref, 'sexo')}, {_rsi_get(ref, 'idade_min')}-{_rsi_get(ref, 'idade_max')} anos): {ref_txt}"
+
+    return {
+        "nome_padronizado": nome_pad,
+        "valor_min": _rsi_get(ref, "valor_min"),
+        "valor_max": _rsi_get(ref, "valor_max"),
+        "status": status,
+        "referencia": ref_txt,
+        "fonte_referencia": _rsi_get(ref, "fonte_referencia", "fonte"),
+        "fonte_url": _rsi_get(ref, "fonte_url"),
+        "sexo_referencia": _rsi_get(ref, "sexo"),
+        "idade_min": _rsi_get(ref, "idade_min"),
+        "idade_max": _rsi_get(ref, "idade_max"),
+        "mensagem": msg,
+    }
+
+
+def recalcular_analises_por_sexo_idade():
+    campos, rows = _rsi_ler_csv("analise_exames.csv")
+
+    if not rows:
+        return 0
+
+    extras = ["referencia", "referencia_texto", "sexo_referencia", "idade_min", "idade_max", "fonte_url"]
+    for c in extras:
+        if c not in campos:
+            campos.append(c)
+
+    alterados = 0
+
+    for r in rows:
+        pid = _rsi_get(r, "paciente_id", "id_paciente")
+        nome = _rsi_get(r, "nome_exame", "nome_padronizado", "exame_nome", "nome", "exame")
+        resultado = _rsi_get(r, "resultado", "valor")
+        unidade = _rsi_get(r, "unidade")
+
+        if not pid or not nome or not resultado:
+            continue
+
+        analise = analisar_resultado_sexo_idade(nome, resultado, unidade, pid)
+
+        r["nome_exame"] = analise["nome_padronizado"] or nome
+        r["nome_padronizado"] = analise["nome_padronizado"] or nome
+        r["valor_min"] = analise["valor_min"]
+        r["valor_max"] = analise["valor_max"]
+        r["status"] = analise["status"]
+        r["mensagem"] = analise["mensagem"]
+        r["referencia"] = analise["referencia"]
+        r["referencia_texto"] = analise["referencia"]
+        r["fonte_referencia"] = analise["fonte_referencia"]
+        r["fonte_url"] = analise["fonte_url"]
+        r["sexo_referencia"] = analise.get("sexo_referencia", "")
+        r["idade_min"] = analise.get("idade_min", "")
+        r["idade_max"] = analise.get("idade_max", "")
+
+        alterados += 1
+
+    _rsi_salvar_csv("analise_exames.csv", campos, rows)
+
+    try:
+        if "_perf_limpar_cache" in globals():
+            _perf_limpar_cache()
+    except Exception:
+        pass
+
+    print(f"[REF SEXO/IDADE] Análises recalculadas por sexo/idade: {alterados}")
+    return alterados
+
+
+try:
+    _rsi_persistir_original
+except NameError:
+    _rsi_persistir_original = _patch_persistir_resultado_item
+
+
+def _patch_persistir_resultado_item(item):
+    if not isinstance(item, dict):
+        return False
+
+    pid = _patch_pid(item)
+    nome_exame = _patch_nome_exame(item)
+    resultado = _patch_resultado_valor(item)
+    data_exame = _patch_data_exame(item)
+    unidade = _patch_get(item, "unidade")
+
+    if not pid or not nome_exame or not resultado:
+        print("[REF SEXO/IDADE] Ignorando exame sem dados mínimos:", item)
+        return False
+
+    analise = analisar_resultado_sexo_idade(nome_exame, resultado, unidade, pid)
+
+    if not unidade:
+        ref = buscar_referencia_sexo_idade(nome_exame, pid)
+        unidade = _rsi_get(ref, "unidade")
+
+    exames = _patch_ler_csv("exames.csv")
+    analises = _patch_ler_csv("analise_exames.csv")
+
+    chave = (
+        pid,
+        _patch_norm(data_exame),
+        _patch_norm(nome_exame),
+        _patch_norm(resultado),
+        _patch_norm(unidade),
+    )
+
+    chaves_exames = {_patch_chave(r) for r in exames}
+    chaves_analises = {_patch_chave(r) for r in analises}
+
+    mudou = False
+
+    if chave not in chaves_exames:
+        exames.append({
+            "exame_id": _patch_proximo_id(exames, "exame_id", 4),
+            "paciente_id": pid,
+            "data_exame": data_exame,
+            "nome_exame": nome_exame,
+            "resultado": resultado,
+            "unidade": unidade,
+            "observacoes": _patch_get(item, "observacoes", "obs") or "Lançado pela interface NutriSoft",
+        })
+
+        _patch_salvar_csv(
+            "exames.csv",
+            exames,
+            ["exame_id", "paciente_id", "data_exame", "nome_exame", "resultado", "unidade", "observacoes"],
+        )
+        mudou = True
+
+    if chave not in chaves_analises:
+        analises.append({
+            "analise_id": _patch_proximo_id(analises, "analise_id"),
+            "paciente_id": pid,
+            "data_exame": data_exame,
+            "nome_exame": nome_exame,
+            "nome_padronizado": analise["nome_padronizado"],
+            "resultado": resultado,
+            "unidade": unidade,
+            "valor_min": analise["valor_min"],
+            "valor_max": analise["valor_max"],
+            "status": analise["status"],
+            "mensagem": analise["mensagem"],
+            "referencia": analise["referencia"],
+            "referencia_texto": analise["referencia"],
+            "fonte_referencia": analise["fonte_referencia"],
+            "fonte_url": analise["fonte_url"],
+            "sexo_referencia": analise.get("sexo_referencia", ""),
+            "idade_min": analise.get("idade_min", ""),
+            "idade_max": analise.get("idade_max", ""),
+        })
+
+        _patch_salvar_csv(
+            "analise_exames.csv",
+            analises,
+            [
+                "analise_id", "paciente_id", "data_exame", "nome_exame", "nome_padronizado",
+                "resultado", "unidade", "valor_min", "valor_max", "status", "mensagem",
+                "referencia", "referencia_texto", "fonte_referencia", "fonte_url",
+                "sexo_referencia", "idade_min", "idade_max",
+            ],
+        )
+        mudou = True
+
+    if mudou:
+        print(
+            f"[REF SEXO/IDADE] Exame persistido: paciente={pid} | exame={nome_exame} | "
+            f"status={analise['status']} | ref={analise.get('sexo_referencia', '')} "
+            f"{analise.get('idade_min', '')}-{analise.get('idade_max', '')}"
+        )
+
+    return mudou
+
+# ===== FIM PATCH REFERENCIAS POR SEXO E IDADE =====
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ===== PATCH DATATABLE EXAMES ALTERADOS: REFERENCIA APOS RESULTADO =====
+
+import csv as _dtref_csv
+import re as _dtref_re
+import unicodedata as _dtref_unicodedata
+from pathlib import Path as _dtref_Path
+
+
+def _dtref_data_dir():
+    try:
+        return _patch_data_dir()
+    except Exception:
+        return _dtref_Path(__file__).resolve().parent / "data_flet"
+
+
+def _dtref_norm(valor):
+    texto = str(valor or "").strip().lower()
+    texto = _dtref_unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not _dtref_unicodedata.combining(c))
+    texto = texto.replace("_", " ").replace("-", " ")
+    texto = _dtref_re.sub(r"[^a-z0-9%/., ]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def _dtref_data_iso(valor):
+    texto = str(valor or "").strip()
+
+    m = _dtref_re.match(r"^(\d{2})/(\d{2})/(\d{4})$", texto)
+    if m:
+        dia, mes, ano = m.groups()
+        return f"{ano}-{mes}-{dia}"
+
+    return texto
+
+
+def _dtref_texto_controle(ctrl):
+    if ctrl is None:
+        return ""
+
+    for attr in ["value", "text"]:
+        try:
+            valor = getattr(ctrl, attr)
+            if valor is not None and str(valor).strip():
+                return str(valor).strip()
+        except Exception:
+            pass
+
+    try:
+        content = getattr(ctrl, "content", None)
+        if content is not None:
+            valor = _dtref_texto_controle(content)
+            if valor:
+                return valor
+    except Exception:
+        pass
+
+    try:
+        label = getattr(ctrl, "label", None)
+        if label is not None:
+            valor = _dtref_texto_controle(label)
+            if valor:
+                return valor
+    except Exception:
+        pass
+
+    try:
+        controls = getattr(ctrl, "controls", None)
+        if controls:
+            partes = []
+            for c in controls:
+                valor = _dtref_texto_controle(c)
+                if valor:
+                    partes.append(valor)
+            return " ".join(partes).strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+def _dtref_texto_coluna(col):
+    try:
+        return _dtref_texto_controle(col.label)
+    except Exception:
+        pass
+
+    try:
+        return _dtref_texto_controle(col.content)
+    except Exception:
+        pass
+
+    return _dtref_texto_controle(col)
+
+
+def _dtref_texto_celula(cell):
+    try:
+        return _dtref_texto_controle(cell.content)
+    except Exception:
+        return _dtref_texto_controle(cell)
+
+
+def _dtref_ler_analises():
+    caminho = _dtref_data_dir() / "analise_exames.csv"
+
+    if not caminho.exists():
+        return []
+
+    with open(caminho, newline="", encoding="utf-8-sig") as f:
+        reader = _dtref_csv.DictReader(f)
+        return [
+            {
+                str(k or "").replace("\ufeff", "").strip(): "" if v is None else str(v).strip()
+                for k, v in r.items()
+            }
+            for r in reader
+        ]
+
+
+def _dtref_referencia_por_linha(data_tabela, exame_tabela, resultado_tabela):
+    data_iso = _dtref_data_iso(data_tabela)
+    exame_n = _dtref_norm(exame_tabela)
+    resultado_n = _dtref_norm(resultado_tabela)
+
+    paciente_id = str(globals().get("PACIENTE_SELECIONADO_ID", "") or "").strip()
+    if paciente_id.isdigit() and len(paciente_id) < 4:
+        paciente_id = paciente_id.zfill(4)
+
+    candidatos = []
+
+    for r in _dtref_ler_analises():
+        pid = str(r.get("paciente_id") or r.get("id_paciente") or "").strip()
+        if pid.isdigit() and len(pid) < 4:
+            pid = pid.zfill(4)
+
+        if paciente_id and pid and pid != paciente_id:
+            continue
+
+        data = r.get("data_exame") or r.get("data") or ""
+
+        nome = (
+            r.get("nome_exame")
+            or r.get("nome_padronizado")
+            or r.get("exame_nome")
+            or r.get("nome")
+            or r.get("exame")
+            or ""
+        )
+
+        resultado = f"{r.get('resultado', '')} {r.get('unidade', '')}".strip()
+
+        data_match = not data_iso or not data or _dtref_data_iso(data) == data_iso
+
+        exame_match = (
+            exame_n
+            and _dtref_norm(nome)
+            and (
+                exame_n == _dtref_norm(nome)
+                or exame_n in _dtref_norm(nome)
+                or _dtref_norm(nome) in exame_n
+            )
+        )
+
+        resultado_match = True
+        if resultado_n:
+            resultado_match = (
+                resultado_n == _dtref_norm(resultado)
+                or resultado_n in _dtref_norm(resultado)
+                or _dtref_norm(r.get("resultado")) in resultado_n
+            )
+
+        if data_match and exame_match and resultado_match:
+            candidatos.append(r)
+
+    if not candidatos:
+        return "-"
+
+    r = candidatos[0]
+    ref = r.get("referencia") or r.get("referencia_texto") or ""
+
+    if not ref:
+        vmin = r.get("valor_min") or ""
+        vmax = r.get("valor_max") or ""
+        unidade = r.get("unidade") or ""
+
+        if vmin and vmax:
+            ref = f"{vmin} a {vmax} {unidade}".strip()
+        elif vmin:
+            ref = f">= {vmin} {unidade}".strip()
+        elif vmax:
+            ref = f"<= {vmax} {unidade}".strip()
+
+    sexo = r.get("sexo_referencia") or ""
+    idade_min = r.get("idade_min") or ""
+    idade_max = r.get("idade_max") or ""
+
+    if ref and (sexo or idade_min or idade_max):
+        return f"{ref}\n{sexo or 'Todos'}, {idade_min or '0'}-{idade_max or '120'} anos"
+
+    return ref or "-"
+
+
+def _dtref_cell(texto, largura=170, negrito=False):
+    return ft.Container(
+        width=largura,
+        padding=6,
+        content=ft.Text(
+            str(texto or "-"),
+            size=10 if negrito else 11,
+            weight=ft.FontWeight.BOLD if negrito else ft.FontWeight.NORMAL,
+            color="#111827" if negrito else "#374151",
+            no_wrap=False,
+            max_lines=None,
+            overflow=ft.TextOverflow.VISIBLE,
+        ),
+    )
+
+
+def _dtref_scroll():
+    try:
+        return ft.ScrollMode.AUTO
+    except Exception:
+        return "auto"
+
+
+def _dtref_linha_parece_exames_alterados(rows):
+    if not rows:
+        return False
+
+    try:
+        cells = list(rows[0].cells)
+    except Exception:
+        return False
+
+    if len(cells) != 4:
+        return False
+
+    data_txt = _dtref_texto_celula(cells[0])
+    status_txt = _dtref_norm(_dtref_texto_celula(cells[3]))
+
+    data_ok = bool(
+        _dtref_re.match(r"^\d{2}/\d{2}/\d{4}$", data_txt)
+        or _dtref_re.match(r"^\d{4}-\d{2}-\d{2}$", data_txt)
+    )
+
+    status_ok = any(
+        termo in status_txt
+        for termo in ["alto", "baixo", "alterado", "critico", "sem analise", "normal"]
+    )
+
+    return data_ok and status_ok
+
+
+try:
+    _dtref_datatable_original
+except NameError:
+    _dtref_datatable_original = ft.DataTable
+
+
+def _dtref_datatable_wrapper(*args, **kwargs):
+    columns = kwargs.get("columns")
+    rows = kwargs.get("rows")
+
+    if columns is None and len(args) >= 1:
+        try:
+            if isinstance(args[0], list):
+                columns = args[0]
+        except Exception:
+            pass
+
+    if rows is None:
+        rows = []
+
+    labels = [_dtref_norm(_dtref_texto_coluna(c)) for c in (columns or [])]
+
+    alvo_por_labels = (
+        len(labels) == 4
+        and labels[0] == "data"
+        and labels[1] == "exame"
+        and labels[2] == "resultado"
+        and labels[3] == "status"
+    )
+
+    alvo_por_linha = (
+        len(columns or []) == 4
+        and _dtref_linha_parece_exames_alterados(rows)
+    )
+
+    if not (alvo_por_labels or alvo_por_linha):
+        return _dtref_datatable_original(*args, **kwargs)
+
+    novas_colunas = [
+        columns[0],
+        columns[1],
+        columns[2],
+        ft.DataColumn(_dtref_cell("Referência aplicada", 230, negrito=True)),
+        columns[3],
+    ]
+
+    novas_linhas = []
+
+    for row in rows or []:
+        try:
+            cells = list(row.cells)
+        except Exception:
+            novas_linhas.append(row)
+            continue
+
+        if len(cells) != 4:
+            novas_linhas.append(row)
+            continue
+
+        data_txt = _dtref_texto_celula(cells[0])
+        exame_txt = _dtref_texto_celula(cells[1])
+        resultado_txt = _dtref_texto_celula(cells[2])
+
+        ref_txt = _dtref_referencia_por_linha(
+            data_txt,
+            exame_txt,
+            resultado_txt,
+        )
+
+        novas_cells = [
+            cells[0],
+            cells[1],
+            cells[2],
+            ft.DataCell(_dtref_cell(ref_txt, 230)),
+            cells[3],
+        ]
+
+        try:
+            novas_linhas.append(ft.DataRow(cells=novas_cells))
+        except Exception:
+            novas_linhas.append(row)
+
+    base_dt = globals().get("_patch_ft_datatable_original", _dtref_datatable_original)
+
+    tabela = base_dt(
+        columns=novas_colunas,
+        rows=novas_linhas,
+        column_spacing=8,
+        horizontal_margin=8,
+    )
+
+    return ft.Row(
+        scroll=_dtref_scroll(),
+        controls=[tabela],
+    )
+
+
+ft.DataTable = _dtref_datatable_wrapper
+
+# ===== FIM PATCH DATATABLE EXAMES ALTERADOS: REFERENCIA APOS RESULTADO =====
+
+
+
+
+
+# ===== PATCH SALVAMENTO DEFINITIVO EXAMES CSV =====
+
+import csv as _sdef_csv
+import re as _sdef_re
+import unicodedata as _sdef_unicodedata
+from pathlib import Path as _sdef_Path
+
+
+def _sdef_data_dir():
+    try:
+        return _patch_data_dir()
+    except Exception:
+        return _sdef_Path(__file__).resolve().parent / "data_flet"
+
+
+def _sdef_norm(valor):
+    texto = str(valor or "").strip().lower()
+    texto = _sdef_unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not _sdef_unicodedata.combining(c))
+    texto = texto.replace("_", " ").replace("-", " ")
+    texto = _sdef_re.sub(r"[^a-z0-9%/., ]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def _sdef_get(row, *campos):
+    if not isinstance(row, dict):
+        return ""
+
+    limpo = {
+        str(k or "").replace("\ufeff", "").strip(): "" if v is None else str(v).strip()
+        for k, v in row.items()
+    }
+
+    for campo in campos:
+        valor = limpo.get(str(campo or "").strip(), "")
+        if valor:
+            return valor
+
+    return ""
+
+
+def _sdef_ler_csv(nome):
+    caminho = _sdef_data_dir() / nome
+
+    if not caminho.exists():
+        return [], []
+
+    with open(caminho, newline="", encoding="utf-8-sig") as f:
+        reader = _sdef_csv.DictReader(f)
+        campos = [
+            str(c or "").replace("\ufeff", "").strip()
+            for c in (reader.fieldnames or [])
+        ]
+        rows = []
+        for r in reader:
+            rows.append({
+                str(k or "").replace("\ufeff", "").strip(): "" if v is None else str(v).strip()
+                for k, v in r.items()
+            })
+
+    return campos, rows
+
+
+def _sdef_salvar_csv(nome, campos, rows):
+    caminho = _sdef_data_dir() / nome
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    tmp = caminho.with_suffix(caminho.suffix + ".tmp")
+
+    campos = list(campos or [])
+
+    for r in rows:
+        for k in r.keys():
+            if k not in campos:
+                campos.append(k)
+
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        writer = _sdef_csv.DictWriter(f, fieldnames=campos, extrasaction="ignore")
+        writer.writeheader()
+        for r in rows:
+            writer.writerow({c: r.get(c, "") for c in campos})
+
+    tmp.replace(caminho)
+
+
+def _sdef_data_iso(valor):
+    texto = str(valor or "").strip()
+
+    m = _sdef_re.match(r"^(\d{2})/(\d{2})/(\d{4})$", texto)
+    if m:
+        dia, mes, ano = m.groups()
+        return f"{ano}-{mes}-{dia}"
+
+    return texto
+
+
+def _sdef_pid(item):
+    pid = _sdef_get(item, "paciente_id", "id_paciente")
+
+    if not pid:
+        try:
+            pid = _patch_pid(item)
+        except Exception:
+            pid = ""
+
+    pid = str(pid or "").strip()
+
+    if pid.isdigit() and len(pid) < 4:
+        pid = pid.zfill(4)
+
+    return pid
+
+
+def _sdef_nome_exame(item):
+    nome = _sdef_get(
+        item,
+        "nome_exame",
+        "exame_nome",
+        "nome_padronizado",
+        "nome",
+        "exame",
+        "analito",
+        "descricao",
+    )
+
+    if nome and nome not in ["-", "None", "null"]:
+        return nome
+
+    try:
+        nome = _patch_nome_exame(item)
+        if nome and nome not in ["-", "None", "null"]:
+            return nome
+    except Exception:
+        pass
+
+    return ""
+
+
+def _sdef_resultado(item):
+    return _sdef_get(item, "resultado", "valor", "valor_resultado", "resultado_exame")
+
+
+def _sdef_unidade(item):
+    return _sdef_get(item, "unidade")
+
+
+def _sdef_chave(row):
+    pid = _sdef_pid(row)
+    data = _sdef_data_iso(_sdef_get(row, "data_exame", "data"))
+    nome = _sdef_nome_exame(row)
+    resultado = _sdef_resultado(row)
+    unidade = _sdef_unidade(row)
+
+    return (
+        pid,
+        _sdef_norm(data),
+        _sdef_norm(nome),
+        _sdef_norm(resultado),
+        _sdef_norm(unidade),
+    )
+
+
+def _sdef_proximo_id(rows, campo, largura=0):
+    maior = 0
+
+    for r in rows:
+        valor = _sdef_get(r, campo)
+        m = _sdef_re.search(r"\d+", str(valor or ""))
+        if m:
+            try:
+                maior = max(maior, int(m.group(0)))
+            except Exception:
+                pass
+
+    novo = maior + 1
+    return str(novo).zfill(largura) if largura else str(novo)
+
+
+def _sdef_analise(item):
+    pid = _sdef_pid(item)
+    nome = _sdef_nome_exame(item)
+    resultado = _sdef_resultado(item)
+    unidade = _sdef_unidade(item)
+
+    try:
+        analise = analisar_resultado_sexo_idade(nome, resultado, unidade, pid)
+        if isinstance(analise, dict):
+            return analise
+    except Exception as exc:
+        print(f"[SALVAR EXAME DEFINITIVO] Falha análise sexo/idade, usando fallback: {exc}")
+
+    try:
+        analise = _patch_analisar(nome, resultado, unidade)
+        if isinstance(analise, dict):
+            return analise
+    except Exception as exc:
+        print(f"[SALVAR EXAME DEFINITIVO] Falha análise fallback: {exc}")
+
+    return {
+        "nome_padronizado": nome,
+        "valor_min": "",
+        "valor_max": "",
+        "status": "Sem análise",
+        "mensagem": f"{nome}: {resultado} {unidade}",
+        "referencia": _sdef_get(item, "referencia", "referencia_texto"),
+        "referencia_texto": _sdef_get(item, "referencia", "referencia_texto"),
+        "fonte_referencia": _sdef_get(item, "fonte_referencia", "fonte"),
+        "fonte_url": _sdef_get(item, "fonte_url"),
+        "sexo_referencia": "",
+        "idade_min": "",
+        "idade_max": "",
+    }
+
+
+def _sdef_limpar_cache():
+    try:
+        if "_perf_limpar_cache" in globals():
+            _perf_limpar_cache()
+    except Exception as exc:
+        print(f"[SALVAR EXAME DEFINITIVO] Falha ao limpar cache de performance: {exc}")
+
+    globals()["EXAMES_CADASTRADOS_MOCK"] = {}
+
+    for nome_cache in [
+        "_PERF_CSV_CACHE",
+        "_PERF_DISPONIVEIS_CACHE",
+        "_PERF_BLOQUEADOS_CACHE",
+    ]:
+        try:
+            cache = globals().get(nome_cache)
+            if hasattr(cache, "clear"):
+                cache.clear()
+        except Exception:
+            pass
+
+    for nome_cache in [
+        "_PERF_REFS_CACHE",
+        "_PERF_PACIENTES_CACHE",
+        "_PERF_CADASTRADOS_CACHE",
+        "_PERF_SYNC_CACHE",
+        "_PERF_PACIENTES_UI_CACHE",
+    ]:
+        try:
+            cache = globals().get(nome_cache)
+            if isinstance(cache, dict):
+                cache["key"] = None
+                cache["value"] = None
+        except Exception:
+            pass
+
+
+def salvar_resultado_exame_csv_definitivo(item):
+    if not isinstance(item, dict):
+        print("[SALVAR EXAME DEFINITIVO] Item inválido:", item)
+        return False
+
+    pid = _sdef_pid(item)
+    data_exame = _sdef_data_iso(_sdef_get(item, "data_exame", "data"))
+    nome_exame = _sdef_nome_exame(item)
+    resultado = _sdef_resultado(item)
+    unidade = _sdef_unidade(item)
+
+    if not pid or not data_exame or not nome_exame or not resultado:
+        print(
+            "[SALVAR EXAME DEFINITIVO] Dados mínimos ausentes:",
+            {
+                "paciente_id": pid,
+                "data_exame": data_exame,
+                "nome_exame": nome_exame,
+                "resultado": resultado,
+                "item": item,
+            },
+        )
+        return False
+
+    analise = _sdef_analise(item)
+
+    if not unidade:
+        unidade = _sdef_get(analise, "unidade")
+        if not unidade:
+            try:
+                ref = buscar_referencia_sexo_idade(nome_exame, pid)
+                unidade = _sdef_get(ref, "unidade")
+            except Exception:
+                unidade = ""
+
+    item["paciente_id"] = pid
+    item["data"] = data_exame
+    item["data_exame"] = data_exame
+    item["nome_exame"] = nome_exame
+    item["exame_nome"] = nome_exame
+    item["nome"] = nome_exame
+    item["exame"] = nome_exame
+    item["resultado"] = resultado
+    item["unidade"] = unidade
+    item["status"] = _sdef_get(analise, "status") or "Sem análise"
+    item["referencia"] = _sdef_get(analise, "referencia", "referencia_texto")
+    item["referencia_texto"] = item["referencia"]
+    item["fonte_referencia"] = _sdef_get(analise, "fonte_referencia", "fonte")
+    item["fonte_url"] = _sdef_get(analise, "fonte_url")
+    item["sexo_referencia"] = _sdef_get(analise, "sexo_referencia")
+    item["idade_min"] = _sdef_get(analise, "idade_min")
+    item["idade_max"] = _sdef_get(analise, "idade_max")
+
+    campos_exames, exames = _sdef_ler_csv("exames.csv")
+    campos_analise, analises = _sdef_ler_csv("analise_exames.csv")
+
+    chave = _sdef_chave(item)
+
+    chaves_exames = {_sdef_chave(r) for r in exames}
+    chaves_analises = {_sdef_chave(r) for r in analises}
+
+    mudou = False
+
+    if chave not in chaves_exames:
+        exames.append({
+            "exame_id": _sdef_proximo_id(exames, "exame_id", 4),
+            "paciente_id": pid,
+            "data_exame": data_exame,
+            "nome_exame": nome_exame,
+            "resultado": resultado,
+            "unidade": unidade,
+            "observacoes": _sdef_get(item, "observacoes", "observacao", "obs") or "Lançado pela interface NutriSoft",
+        })
+
+        for c in ["exame_id", "paciente_id", "data_exame", "nome_exame", "resultado", "unidade", "observacoes"]:
+            if c not in campos_exames:
+                campos_exames.append(c)
+
+        _sdef_salvar_csv("exames.csv", campos_exames, exames)
+        mudou = True
+
+    if chave not in chaves_analises:
+        analises.append({
+            "analise_id": _sdef_proximo_id(analises, "analise_id"),
+            "paciente_id": pid,
+            "data_exame": data_exame,
+            "nome_exame": nome_exame,
+            "nome_padronizado": _sdef_get(analise, "nome_padronizado") or nome_exame,
+            "resultado": resultado,
+            "unidade": unidade,
+            "valor_min": _sdef_get(analise, "valor_min"),
+            "valor_max": _sdef_get(analise, "valor_max"),
+            "status": _sdef_get(analise, "status") or "Sem análise",
+            "mensagem": _sdef_get(analise, "mensagem"),
+            "referencia": _sdef_get(analise, "referencia", "referencia_texto"),
+            "referencia_texto": _sdef_get(analise, "referencia", "referencia_texto"),
+            "fonte_referencia": _sdef_get(analise, "fonte_referencia", "fonte"),
+            "fonte_url": _sdef_get(analise, "fonte_url"),
+            "sexo_referencia": _sdef_get(analise, "sexo_referencia"),
+            "idade_min": _sdef_get(analise, "idade_min"),
+            "idade_max": _sdef_get(analise, "idade_max"),
+        })
+
+        for c in [
+            "analise_id",
+            "paciente_id",
+            "data_exame",
+            "nome_exame",
+            "nome_padronizado",
+            "resultado",
+            "unidade",
+            "valor_min",
+            "valor_max",
+            "status",
+            "mensagem",
+            "referencia",
+            "referencia_texto",
+            "fonte_referencia",
+            "fonte_url",
+            "sexo_referencia",
+            "idade_min",
+            "idade_max",
+        ]:
+            if c not in campos_analise:
+                campos_analise.append(c)
+
+        _sdef_salvar_csv("analise_exames.csv", campos_analise, analises)
+        mudou = True
+
+    _sdef_limpar_cache()
+
+    if mudou:
+        print(
+            f"[SALVAR EXAME DEFINITIVO] Gravado em CSV: paciente={pid} | "
+            f"data={data_exame} | exame={nome_exame} | resultado={resultado} {unidade} | "
+            f"status={item['status']}"
+        )
+    else:
+        print(
+            f"[SALVAR EXAME DEFINITIVO] Registro já existia no CSV: paciente={pid} | "
+            f"data={data_exame} | exame={nome_exame} | resultado={resultado} {unidade}"
+        )
+
+    return True
+
+# ===== FIM PATCH SALVAMENTO DEFINITIVO EXAMES CSV =====
+
+
+
+
+
+# ===== PATCH LISTA CADASTRADOS DEFINITIVA CSV =====
+
+import csv as _lcd_csv
+import re as _lcd_re
+import unicodedata as _lcd_unicodedata
+from pathlib import Path as _lcd_Path
+
+
+def _lcd_data_dir():
+    try:
+        return _patch_data_dir()
+    except Exception:
+        return _lcd_Path(__file__).resolve().parent / "data_flet"
+
+
+def _lcd_norm(valor):
+    texto = str(valor or "").strip().lower()
+    texto = _lcd_unicodedata.normalize("NFKD", texto)
+    texto = "".join(c for c in texto if not _lcd_unicodedata.combining(c))
+    texto = texto.replace("_", " ").replace("-", " ")
+    texto = _lcd_re.sub(r"[^a-z0-9%/., ]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def _lcd_id(valor):
+    texto = _lcd_norm(valor)
+    texto = _lcd_re.sub(r"[^a-z0-9]+", "_", texto).strip("_")
+    return texto
+
+
+def _lcd_get(row, *campos):
+    if not isinstance(row, dict):
+        return ""
+
+    limpo = {
+        str(k or "").replace("\ufeff", "").strip(): "" if v is None else str(v).strip()
+        for k, v in row.items()
+    }
+
+    for campo in campos:
+        valor = limpo.get(str(campo or "").strip(), "")
+        if valor:
+            return valor
+
+    return ""
+
+
+def _lcd_data_iso(valor):
+    texto = str(valor or "").strip()
+
+    m = _lcd_re.match(r"^(\d{2})/(\d{2})/(\d{4})$", texto)
+    if m:
+        dia, mes, ano = m.groups()
+        return f"{ano}-{mes}-{dia}"
+
+    m = _lcd_re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", texto)
+    if m:
+        ano, mes, dia = m.groups()
+        return f"{ano}-{int(mes):02d}-{int(dia):02d}"
+
+    return texto
+
+
+def _lcd_pid(valor):
+    pid = str(valor or "").strip()
+    if pid.isdigit() and len(pid) < 4:
+        pid = pid.zfill(4)
+    return pid
+
+
+def _lcd_ler_csv(nome):
+    caminho = _lcd_data_dir() / nome
+
+    if not caminho.exists():
+        return []
+
+    with open(caminho, newline="", encoding="utf-8-sig") as f:
+        reader = _lcd_csv.DictReader(f)
+        return [
+            {
+                str(k or "").replace("\ufeff", "").strip(): "" if v is None else str(v).strip()
+                for k, v in r.items()
+            }
+            for r in reader
+        ]
+
+
+def _lcd_nome_exame(row):
+    nome = _lcd_get(
+        row,
+        "nome_exame",
+        "nome_padronizado",
+        "exame_nome",
+        "nome",
+        "exame",
+        "descricao",
+        "analito",
+        "id",
+    )
+
+    if nome and nome not in ["-", "None", "null"]:
+        return nome
+
+    return ""
+
+
+def _lcd_tokens_nome(nome):
+    tokens = set()
+
+    nome = str(nome or "").strip()
+    if not nome:
+        return tokens
+
+    tokens.add(_lcd_norm(nome))
+    tokens.add(_lcd_id(nome))
+
+    aliases = {
+        "ferritina": ["ferritina", "ferr"],
+        "ferro": ["ferro", "ferro_serico"],
+        "saturacao_da_transferrina": [
+            "saturacao_da_transferrina",
+            "saturacao_transferrina",
+            "transferrina_saturacao",
+        ],
+        "glicose": ["glicose", "glicemia", "glucose"],
+        "hemoglobina_glicada": ["hemoglobina_glicada", "hba1c", "glicada"],
+        "colesterol_total": ["colesterol_total", "colesterol"],
+        "triglicerideos": ["triglicerideos", "triglicerides", "trig"],
+        "creatinina": ["creatinina", "creat"],
+    }
+
+    base = _lcd_id(nome)
+
+    for canon, vals in aliases.items():
+        vals_norm = {_lcd_id(v) for v in vals}
+        vals_norm.add(canon)
+
+        if base in vals_norm:
+            tokens.update(vals_norm)
+
+    return {t for t in tokens if t}
+
+
+def _lcd_tokens_item(item):
+    tokens = set()
+
+    if isinstance(item, dict):
+        for campo in [
+            "id",
+            "id_canonico",
+            "nome_exame",
+            "nome_padronizado",
+            "exame_nome",
+            "nome",
+            "exame",
+            "descricao",
+            "analito",
+        ]:
+            valor = _lcd_get(item, campo)
+            tokens.update(_lcd_tokens_nome(valor))
+
+        nome = _lcd_nome_exame(item)
+        if nome:
+            tokens.update(_lcd_tokens_nome(nome))
+    else:
+        tokens.update(_lcd_tokens_nome(item))
+
+    return {t for t in tokens if t}
+
+
+def _lcd_referencia_resumo(row):
+    ref = _lcd_get(row, "referencia", "referencia_texto")
+
+    if not ref:
+        vmin = _lcd_get(row, "valor_min")
+        vmax = _lcd_get(row, "valor_max")
+        unidade = _lcd_get(row, "unidade")
+
+        if vmin and vmax:
+            ref = f"{vmin} - {vmax} {unidade}".strip()
+        elif vmin:
+            ref = f">= {vmin} {unidade}".strip()
+        elif vmax:
+            ref = f"<= {vmax} {unidade}".strip()
+
+    return ref
+
+
+def _lcd_item_cadastrado(row):
+    nome = _lcd_nome_exame(row)
+    grupo = _lcd_get(row, "grupo")
+
+    if not grupo:
+        try:
+            ref = _patch_ref(nome)
+            grupo = _patch_get(ref, "grupo")
+        except Exception:
+            grupo = ""
+
+    if not grupo:
+        try:
+            grupo = _patch_grupo_exame_correto(nome, "")
+        except Exception:
+            grupo = ""
+
+    referencia = _lcd_referencia_resumo(row)
+
+    fonte = _lcd_get(row, "fonte_referencia", "fonte")
+    if not fonte:
+        try:
+            ref = _patch_ref(nome)
+            fonte = _patch_get(ref, "fonte_referencia", "fonte")
+        except Exception:
+            fonte = ""
+
+    item = dict(row)
+    item.update({
+        "id": _lcd_id(nome),
+        "id_canonico": _lcd_id(nome),
+        "nome": nome,
+        "nome_exame": nome,
+        "exame_nome": nome,
+        "exame": nome,
+        "grupo": grupo,
+        "referencia": referencia,
+        "referencia_texto": referencia,
+        "fonte": fonte,
+        "fonte_referencia": fonte,
+    })
+
+    return item
+
+
+def _lcd_linhas_cadastradas_csv(paciente_id, data_exame):
+    pid_alvo = _lcd_pid(paciente_id)
+    data_alvo = _lcd_data_iso(data_exame)
+
+    linhas = []
+
+    # analise_exames.csv é a fonte mais completa para exibir referência/status.
+    for row in _lcd_ler_csv("analise_exames.csv"):
+        pid = _lcd_pid(_lcd_get(row, "paciente_id", "id_paciente"))
+        data = _lcd_data_iso(_lcd_get(row, "data_exame", "data"))
+
+        if pid == pid_alvo and data == data_alvo:
+            nome = _lcd_nome_exame(row)
+            if nome:
+                linhas.append(_lcd_item_cadastrado(row))
+
+    # fallback: se o exame existe só em exames.csv por algum erro antigo.
+    tokens_existentes = set()
+    for item in linhas:
+        tokens_existentes.update(_lcd_tokens_item(item))
+
+    for row in _lcd_ler_csv("exames.csv"):
+        pid = _lcd_pid(_lcd_get(row, "paciente_id", "id_paciente"))
+        data = _lcd_data_iso(_lcd_get(row, "data_exame", "data"))
+
+        if pid != pid_alvo or data != data_alvo:
+            continue
+
+        nome = _lcd_nome_exame(row)
+        tokens = _lcd_tokens_nome(nome)
+
+        if not nome or (tokens and tokens & tokens_existentes):
+            continue
+
+        linhas.append(_lcd_item_cadastrado(row))
+        tokens_existentes.update(tokens)
+
+    # Dedup final por token canônico.
+    saida = []
+    vistos = set()
+
+    for item in linhas:
+        tokens = _lcd_tokens_item(item)
+        chave = sorted(tokens)[0] if tokens else _lcd_id(_lcd_nome_exame(item))
+
+        if chave in vistos:
+            continue
+
+        vistos.add(chave)
+        saida.append(item)
+
+    saida.sort(key=lambda x: _lcd_norm(_lcd_nome_exame(x)))
+
+    return saida
+
+
+try:
+    _lcd_exames_ja_original
+except NameError:
+    _lcd_exames_ja_original = exames_ja_cadastrados_por_data
+
+
+def exames_ja_cadastrados_por_data(paciente_id, data_exame):
+    linhas = _lcd_linhas_cadastradas_csv(paciente_id, data_exame)
+
+    try:
+        globals()["EXAMES_CADASTRADOS_MOCK"] = {
+            (
+                _lcd_pid(paciente_id),
+                _lcd_data_iso(data_exame),
+            ): [
+                item.get("id") or item.get("id_canonico") or _lcd_id(_lcd_nome_exame(item))
+                for item in linhas
+            ]
+        }
+    except Exception:
+        pass
+
+    return linhas
+
+
+try:
+    _lcd_disponiveis_original
+except NameError:
+    _lcd_disponiveis_original = exames_disponiveis_por_data
+
+
+def exames_disponiveis_por_data(paciente_id, data_exame):
+    try:
+        lista = _lcd_disponiveis_original(paciente_id, data_exame)
+    except Exception:
+        lista = []
+
+    cadastrados = _lcd_linhas_cadastradas_csv(paciente_id, data_exame)
+
+    tokens_bloqueados = set()
+    for item in cadastrados:
+        tokens_bloqueados.update(_lcd_tokens_item(item))
+
+    disponiveis = []
+
+    for exame in lista or []:
+        tokens_exame = _lcd_tokens_item(exame)
+
+        if tokens_exame and tokens_exame & tokens_bloqueados:
+            continue
+
+        disponiveis.append(exame)
+
+    return disponiveis
+
+
+def _lcd_refresh_pos_operacao_exame():
+    try:
+        if "_perf_limpar_cache" in globals():
+            _perf_limpar_cache()
+    except Exception:
+        pass
+
+    try:
+        sincronizar_resultados_exames_mock_data_flet()
+    except Exception as exc:
+        print(f"[LISTA CADASTRADOS] Falha ao sincronizar resultados: {exc}")
+
+    try:
+        atualizar_pacientes_csv_real_definitivo()
+    except Exception as exc:
+        print(f"[LISTA CADASTRADOS] Falha ao atualizar pacientes: {exc}")
+
+
+try:
+    _lcd_salvar_definitivo_original
+except NameError:
+    _lcd_salvar_definitivo_original = salvar_resultado_exame_csv_definitivo
+
+
+def salvar_resultado_exame_csv_definitivo(item):
+    ok = _lcd_salvar_definitivo_original(item)
+
+    if ok:
+        _lcd_refresh_pos_operacao_exame()
+        print("[LISTA CADASTRADOS] Índice atualizado após salvar exame.")
+
+    return ok
+
+
+try:
+    _lcd_excluir_original
+except NameError:
+    _lcd_excluir_original = excluir_exame_cadastrado_errado
+
+
+def excluir_exame_cadastrado_errado(paciente_id, data_exame, exame):
+    total = _lcd_excluir_original(paciente_id, data_exame, exame)
+
+    if total:
+        _lcd_refresh_pos_operacao_exame()
+        print("[LISTA CADASTRADOS] Índice atualizado após excluir exame.")
+
+    return total
+
+# ===== FIM PATCH LISTA CADASTRADOS DEFINITIVA CSV =====
+
+
+
 if __name__ == "__main__":
     inicializar_base_flet()
+    gerar_referencias_exames_sexo_idade()
+    recalcular_analises_por_sexo_idade()
+    gerar_referencias_exames_sexo_idade()
+    recalcular_analises_por_sexo_idade()
+    deduplicar_exames_e_analises_csv()
     atualizar_pacientes_csv_real_definitivo()
     aplicar_catalogo_fleury_nas_listas_do_app()
     sincronizar_data_flet_para_interface()
